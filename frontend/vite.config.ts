@@ -5,13 +5,14 @@ import tailwindcss from "@tailwindcss/vite"
 
 // https://vite.dev/config/
 export default defineConfig({
+  appType: 'spa',
   plugins: [
     react({
       babel: {
         plugins: [['babel-plugin-react-compiler']],
       },
     }),
-    tailwindcss()
+    tailwindcss(),
   ],
   resolve: {
     alias: {

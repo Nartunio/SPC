@@ -16,16 +16,16 @@ interface Signup1Props {
 }
 
 const Signup1 = ({
-  heading = "Signup",
+  heading = "Rejestracja",
   logo = {
     url: "https://www.shadcnblocks.com",
     src: "https://deifkwefumgah.cloudfront.net/shadcnblocks/block/logos/shadcnblockscom-wordmark.svg",
     alt: "logo",
     title: "shadcnblocks.com",
   },
-  buttonText = "Create Account",
-  signupText = "Already a user?",
-  signupUrl = "https://shadcnblocks.com",
+  buttonText = "Utwórz konto",
+  signupText = "Masz już konto?",
+  signupUrl = "/login",
 }: Signup1Props) => {
   return (
     <section className="bg-muted h-screen">
@@ -50,13 +50,13 @@ const Signup1 = ({
             />
             <Input
               type="password"
-              placeholder="Password"
+              placeholder="Podaj hasło"
               className="text-sm"
               required
             />
             <Input
               type="password"
-              placeholder="Confirm Password"
+              placeholder="Podaj hasło ponownie"
               className="text-sm"
               required
             />
@@ -70,7 +70,7 @@ const Signup1 = ({
               href={signupUrl}
               className="text-primary font-medium hover:underline"
             >
-              Login
+              Zaloguj się
             </a>
           </div>
         </div>
