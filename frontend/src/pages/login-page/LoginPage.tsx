@@ -1,11 +1,14 @@
-import Navbar from "../landing-page/components/Navbar/Navbar";
 import { Login1 } from "./components/Login1";
 
-function LoginPage(){
+function LoginPage() {
     return <>
-        <Navbar />
-        <Login1 />
-    </>
+        <Login1 logo={{
+            url: "",
+            src: "",
+            alt: "",
+            title: undefined
+        }} />
+    </>;
 }
 
 export default LoginPage;
