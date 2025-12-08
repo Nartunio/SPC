@@ -18,7 +18,8 @@ INSTALLED_APPS = [
     "django.contrib.messages",
     "django.contrib.staticfiles",
     "core",
-    "rest_framework"
+    "rest_framework",
+    "corsheaders",
 ]
 
 MIDDLEWARE = [
@@ -29,6 +30,8 @@ MIDDLEWARE = [
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
+    
+    "corsheaders.middleware.CorsMiddleware",
 ]
 
 ROOT_URLCONF = "myproj.urls"
@@ -70,4 +73,10 @@ AUTH0_CLIENT_SECRET = os.getenv("AUTH0_CLIENT_SECRET")
 AUTH0_AUDIENCE = os.getenv("AUTH0_AUDIENCE")  # opcjonalnie
 
 # Dla lokalnych testów CSRF (Django 5 wymaga pełnego originu)
-CSRF_TRUSTED_ORIGINS = ["http://127.0.0.1:8000"]
+CSRF_TRUSTED_ORIGINS = ["http://127.0.0.1:8000", "http://127.0.0.1:5173"]
+CORS_ALLOWED_ORIGINS = [
+    "http://127.0.0.1:5173",
+]
+CORS_ALLOW_CREDENTIALS = True
+SESSION_COOKIE_SECURE = False
+CSRF_COOKIE_SECURE = False

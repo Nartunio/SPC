@@ -8,6 +8,7 @@ import LoginPage from './pages/login-page/LoginPage.tsx';
 import MenubarPage from './pages/menubar/MenubarPage.tsx';
 import SignupPage from './pages/signup-page/SignupPage.tsx';
 import { NoRoutePage } from './pages/no-route-page/NoRoutePage.tsx';
+import LoggedInPage from './pages/logged-in-page/LoggedInPage.tsx';
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
@@ -18,6 +19,7 @@ createRoot(document.getElementById('root')!).render(
         <Route path="/signup" element={<SignupPage />} />
         <Route path="/panel" element={<MenubarPage />} />
         <Route path="/menubar" element={<MenubarPage />} />
+        <Route path='/logged-in-page' element={<LoggedInPage />} />
         <Route path="*" element={<NoRoutePage />} />
       </Routes>
     </BrowserRouter>

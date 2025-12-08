@@ -61,7 +61,7 @@ def callback(request):
     request.session["user"] = userinfo
     request.session["id_token"] = id_token
     request.session["access_token"] = token.get("access_token")
-    return redirect("index")
+    return redirect("http://127.0.0.1:5173/logged-in-page")
 
 # 5) Wylogowanie – czyść sesję + redirect do /v2/logout
 def logout_view(request):
