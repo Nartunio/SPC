@@ -6,6 +6,10 @@ from django.http import HttpResponse, JsonResponse, HttpResponseRedirect
 from django.shortcuts import render, redirect
 from django.urls import reverse
 
+from rest_framework import status
+from rest_framework.decorators import api_view
+from rest_framework.response import Response
+
 from authlib.integrations.django_client import OAuth
 from jose import jwt, JWTError
 
@@ -20,9 +24,18 @@ auth0 = oauth.register(
 )
 
 # 2) Widok główny
+@api_view(['GET'])
 def index(request):
     user = request.session.get("user")
-    return render(request, "index.html", {"user": user})
+    if user:
+        return Response({
+            "username": user,
+            "status": 'logged_in'
+        })
+    else:
+        return Response({
+            "status": 'logged_out'
+        }, status=status.HTTP_401_UNAUTHORIZED)
 
 # 3) Start logowania – redirect do /authorize
 def login_view(request):
