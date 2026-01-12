@@ -6,5 +6,6 @@ from . import views
 urlpatterns = [
     path('public', views.public),
     path('private', views.private),
-    path('private-scoped', views.private_scoped)
+    path('private-scoped', views.private_scoped),
+    path('jwt-info', views.jwt_info),
 ]
