@@ -1,67 +1,115 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState } from 'react';
+import { useAuth0 } from '@auth0/auth0-react';
 
-type User = {
-  id: number;
-  name: string;
-  // add fields matching your API
-};
+type FetchState = 'idle' | 'loading' | 'success' | 'error';
 
-function LoggedInPage(){
-  const [data, setData] = useState<User[] | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+export default function LoggedInPage() {
+	const { isAuthenticated, isLoading, loginWithRedirect, getAccessTokenSilently, user, logout } = useAuth0();
 
-  useEffect(() => {
-    const controller = new AbortController();
+	const [state, setState] = useState<FetchState>('idle');
+	const [status, setStatus] = useState<number | null>(null);
+	const [statusText, setStatusText] = useState<string>('');
+	const [body, setBody] = useState<string>('');
+	const [error, setError] = useState<string>('');
 
-    async function load() {
-      try {
-        setLoading(true);
-        setError(null);
+	async function fetchPrivate() {
+		setState('loading');
+		setError('');
+		setBody('');
+		setStatus(null);
+		setStatusText('');
+		try {
+			const token = await getAccessTokenSilently({
+				authorizationParams: {
+					audience: import.meta.env.VITE_AUTH0_AUDIENCE,
+				},
+			});
 
-        const resp = await fetch("http://127.0.0.1:8000/", {
-          method: "GET",
-          headers: {
-            "Accept": "application/json",
-          },
-          signal: controller.signal,
-          credentials: "include",
-        });
+			const res = await fetch('http://localhost:8000/auth/private', {
+				method: 'GET',
+				headers: {
+					Accept: '*/*',
+					Authorization: `Bearer ${token}`,
+				},
+			});
 
-        console.log(resp);
+			setStatus(res.status);
+			setStatusText(res.statusText);
 
-        if (!resp.ok) {
-          throw new Error(`Request failed: ${resp.status} ${resp.statusText}`);
-        }
+			const contentType = res.headers.get('content-type') || '';
+			if (contentType.includes('application/json')) {
+				try {
+					const json = await res.json();
+					setBody(JSON.stringify(json, null, 2));
+				} catch (e) {
+					const text = await res.text();
+					setBody(text);
+				}
+			} else {
+				const text = await res.text();
+				setBody(text);
+			}
 
-        const json = await resp.json() as User[];
-        setData(json);
-      } catch (e: any) {
-        if (e.name !== "AbortError") setError(e.message ?? "Unknown error");
-      } finally {
-        setLoading(false);
-      }
-    }
+			setState(res.ok ? 'success' : 'error');
+		} catch (e: unknown) {
+			setState('error');
+			setError(e instanceof Error ? e.message : 'Unknown error');
+		}
+	}
 
-    load();
-    return () => controller.abort();
-  }, []);
+	useEffect(() => {
+		if (!isLoading && isAuthenticated) {
+			fetchPrivate();
+		}
+	}, [isLoading, isAuthenticated]);
 
-  return (
-    <>
-      <section className="bg-muted h-screen">
-        <div className="flex h-full items-center justify-center flex-col gap-4">
-          {loading && <div>Loading…</div>}
-          {error && <div className="text-red-600">Error: {error}</div>}
-          {!loading && !error && (
-            <pre className="text-left bg-white p-4 rounded shadow max-w-lg overflow-auto">
-              {JSON.stringify(data, null, 2)}
-            </pre>
-          )}
-        </div>
-      </section>
-    </>
-  );
+	return (
+		<div style={{ padding: '1rem', maxWidth: 900, margin: '0 auto' }}>
+			<h1 style={{ fontSize: 24, fontWeight: 600 }}>Private Endpoint Response</h1>
+
+			<div style={{ marginTop: 8, display: 'flex', gap: 8, alignItems: 'center' }}>
+				{!isAuthenticated ? (
+					<button onClick={() => loginWithRedirect()} style={{ padding: '6px 12px' }}>Log in</button>
+				) : (
+					<>
+						<span style={{ color: '#555' }}>Signed in as {user?.email || user?.name}</span>
+						<button onClick={() => logout({ logoutParams: { returnTo: window.location.origin } })} style={{ padding: '6px 12px' }}>Log out</button>
+						<button onClick={fetchPrivate} disabled={state === 'loading'} style={{ padding: '6px 12px' }}>
+							{state === 'loading' ? 'Loading…' : 'Re-fetch'}
+						</button>
+					</>
+				)}
+			</div>
+
+			{state !== 'idle' && (
+				<div style={{ marginTop: '1rem' }}>
+					<div style={{ marginBottom: '0.5rem', color: '#555' }}>
+						<span>Status: </span>
+						<strong>{status ?? '—'}</strong>
+						{statusText ? <span> ({statusText})</span> : null}
+					</div>
+					{error && (
+						<div style={{ color: 'crimson', marginBottom: '0.5rem' }}>
+							Error: {error}
+						</div>
+					)}
+					<pre
+						style={{
+							background: '#0b1021',
+							color: '#e6edf3',
+							padding: '1rem',
+							borderRadius: 8,
+							overflowX: 'auto',
+							whiteSpace: 'pre-wrap',
+							wordBreak: 'break-word',
+							border: '1px solid #1f2a4d',
+						}}
+					>
+						{body || '(empty response body)'}
+					</pre>
+				</div>
+			)}
+		</div>
+	);
 }
 
-export default LoggedInPage;

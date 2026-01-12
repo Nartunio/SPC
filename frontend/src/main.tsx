@@ -1,27 +1,33 @@
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
-
 import './index.css'
+
+import { Auth0Provider } from '@auth0/auth0-react';
+
 import LandingPage from './pages/landing-page/LandingPage.tsx';
 import { BrowserRouter, Route, Routes } from 'react-router-dom';
-import LoginPage from './pages/login-page/LoginPage.tsx';
-import MenubarPage from './pages/menubar/MenubarPage.tsx';
-import SignupPage from './pages/signup-page/SignupPage.tsx';
 import { NoRoutePage } from './pages/no-route-page/NoRoutePage.tsx';
 import LoggedInPage from './pages/logged-in-page/LoggedInPage.tsx';
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <BrowserRouter>
-      <Routes>
-        <Route path="/" element={<LandingPage />} />
-        <Route path="/login" element={<LoginPage />} />
-        <Route path="/signup" element={<SignupPage />} />
-        <Route path="/panel" element={<MenubarPage />} />
-        <Route path="/menubar" element={<MenubarPage />} />
-        <Route path='/logged-in-page' element={<LoggedInPage />} />
-        <Route path="*" element={<NoRoutePage />} />
-      </Routes>
-    </BrowserRouter>
+    <Auth0Provider
+      domain={import.meta.env.VITE_AUTH0_DOMAIN}
+      clientId={import.meta.env.VITE_AUTH0_CLIENT_ID}
+      authorizationParams={{
+        redirect_uri: window.location.origin,
+        audience: import.meta.env.VITE_AUTH0_AUDIENCE,
+      }}
+      useRefreshTokens={true}
+      cacheLocation="localstorage"
+    >
+      <BrowserRouter>
+        <Routes>
+          <Route path="/" element={<LandingPage />} />
+          <Route path='/logged-in-page' element={<LoggedInPage />} />
+          <Route path="*" element={<NoRoutePage />} />
+        </Routes>
+      </BrowserRouter>
+    </Auth0Provider>
   </StrictMode>,
 )

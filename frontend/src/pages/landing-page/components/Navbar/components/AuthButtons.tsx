@@ -1,15 +1,17 @@
 import { Button } from '@/components/ui/button'
-import { NavLink, Link } from 'react-router-dom'
+import { useAuth0 } from "@auth0/auth0-react";
 
 export const AuthButtons = () => {
+  const { loginWithRedirect } = useAuth0();
   return (
     <div className="flex flex-row">
-        <Link to="http://127.0.0.1:8000/login">
-            <Button variant="outline" className="mr-4 cursor-pointer">Logowanie</Button>
-        </Link>
-        <NavLink to="/signup">
-            <Button variant="default" className="cursor-pointer">Rejestracja</Button>
-        </NavLink>
+      <Button 
+        variant="outline" 
+        className="mr-4 cursor-pointer"
+        onClick={() => loginWithRedirect()}
+      >
+        Logowanie
+      </Button>
     </div>
   )
 }
