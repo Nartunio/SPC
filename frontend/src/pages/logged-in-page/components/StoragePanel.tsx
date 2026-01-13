@@ -10,10 +10,11 @@ import {
   Share2,
   Trash2,
   UploadCloud,
+  FolderPlus,
+  Copy,
 } from "lucide-react";
 import { createApi } from "@/lib/api";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 
 type FileItem = {
@@ -26,8 +27,23 @@ type FileItem = {
 type ListResponse = {
   prefix: string;
   path?: string;
-  directories: { name: string }[];
+  directories: { name: string; is_empty?: boolean }[];
   files: FileItem[];
+};
+
+type ShareVisibility = "private" | "public" | "protected";
+type SharePermission = "read" | "read-write";
+type ShareResult = {
+  share_id: string;
+  token: string;
+  access_url?: string;
+  visibility: ShareVisibility;
+  target_sub?: string | null;
+  target_email?: string | null;
+  permission: SharePermission;
+  expires_at?: string | null;
+  allowed_emails?: string[];
+  key: string;
 };
 
 function formatBytes(size?: number) {
@@ -44,18 +60,40 @@ function formatBytes(size?: number) {
 }
 
 export default function StoragePanel() {
-  const { getAccessTokenSilently } = useAuth0();
-  const api = useMemo(
-    () =>
-      createApi(() =>
-        getAccessTokenSilently({
+  const { getAccessTokenSilently, loginWithRedirect } = useAuth0();
+
+  const getTokenWithRenew = useCallback(async () => {
+    try {
+      return await getAccessTokenSilently({
+        authorizationParams: {
+          audience: (import.meta as any).env.VITE_AUTH0_AUDIENCE,
+          scope: 'openid profile email offline_access',
+        },
+      });
+    } catch (err: any) {
+      const message = err?.message || '';
+      const isMissingRefresh =
+        message.includes('Missing Refresh Token') ||
+        message.includes('login_required') ||
+        message.includes('consent_required');
+
+      if (isMissingRefresh) {
+        // Force a full login to obtain a new refresh token
+        await loginWithRedirect({
           authorizationParams: {
+            redirect_uri: window.location.origin,
             audience: (import.meta as any).env.VITE_AUTH0_AUDIENCE,
+            scope: 'openid profile email offline_access',
+            prompt: 'login',
           },
-        })
-      ),
-    [getAccessTokenSilently]
-  );
+        });
+      }
+
+      throw err;
+    }
+  }, [getAccessTokenSilently, loginWithRedirect]);
+
+  const api = useMemo(() => createApi(getTokenWithRenew), [getTokenWithRenew]);
 
   const [list, setList] = useState<ListResponse | null>(null);
   const [loading, setLoading] = useState(false);
@@ -117,8 +155,6 @@ export default function StoragePanel() {
   }, []);
 
   const [currentPath, setCurrentPath] = useState("");
-  const [newDir, setNewDir] = useState("");
-  const [uploadPath, setUploadPath] = useState("");
   const fileRef = useRef<HTMLInputElement | null>(null);
   const [dragActive, setDragActive] = useState(false);
   const [dragOverFolder, setDragOverFolder] = useState<string | null>(null);
@@ -131,6 +167,37 @@ export default function StoragePanel() {
   const [versions, setVersions] = useState<any[] | null>(null);
 
   const [logs, setLogs] = useState<any[] | null>(null);
+
+  const [shareState, setShareState] = useState<{
+    key: string;
+    isDir: boolean;
+    visibility: ShareVisibility;
+    permission: SharePermission;
+    targetEmail: string;
+    allowedEmails: string;
+    expiresIn: string;
+    result?: ShareResult | null;
+  } | null>(null);
+  const [shareLoading, setShareLoading] = useState(false);
+
+  useEffect(() => {
+    if (!shareState) return;
+    if (shareState.visibility !== "private" && shareState.permission !== "read") {
+      setShareState({ ...shareState, permission: "read" });
+    }
+  }, [shareState?.visibility]);
+
+  const [hoveredNameKey, setHoveredNameKey] = useState<string | null>(null);
+  const [editingKey, setEditingKey] = useState<string | null>(null);
+  const [editingValue, setEditingValue] = useState("");
+  const editInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    if (editingKey && editInputRef.current) {
+      editInputRef.current.focus();
+      editInputRef.current.select();
+    }
+  }, [editingKey]);
 
   const joinedPath = useCallback(
     (name: string) => {
@@ -148,6 +215,34 @@ export default function StoragePanel() {
     [joinedPath]
   );
 
+  const baseNameFromKey = useCallback((key: string) => {
+    return key.replace(/\/$/, "").split("/").pop() || "";
+  }, []);
+
+  const parentPathFromKey = useCallback((key: string) => {
+    const parts = key.replace(/\/$/, "").split("/");
+    parts.pop();
+    return parts.join("/");
+  }, []);
+
+  const computeUniqueFolderName = useCallback(() => {
+    const base = "New folder";
+    if (!list) return base;
+    const existing = new Set([
+      ...(list.directories || []).map((d) => d.name),
+      ...(list.files || []).map((f) => f.name),
+    ]);
+    if (!existing.has(base)) return base;
+    let idx = 1;
+    while (existing.has(`${base} ${idx}`)) idx += 1;
+    return `${base} ${idx}`;
+  }, [list]);
+
+  const startRename = useCallback((key: string, name: string) => {
+    setEditingKey(key);
+    setEditingValue(name);
+  }, []);
+
   const refresh = useCallback(
     async (path?: string) => {
       setLoading(true);
@@ -162,25 +257,41 @@ export default function StoragePanel() {
     [api, pushToast]
   );
 
+  const commitRename = useCallback(
+    async (key: string, isDir: boolean) => {
+      const newName = editingValue.trim();
+      const currentName = baseNameFromKey(key);
+
+      if (!newName) {
+        pushToast("error", "Name cannot be empty");
+        return;
+      }
+
+      if (newName === currentName) {
+        setEditingKey(null);
+        setEditingValue("");
+        return;
+      }
+
+      const parent = parentPathFromKey(key);
+      const res = await api.rename(key, parent, newName);
+      if (!res.ok) {
+        pushToast("error", JSON.stringify(res.data));
+        return;
+      }
+
+      pushToast("success", `Renamed to ${newName}`);
+      setEditingKey(null);
+      setEditingValue("");
+      refresh(currentPath);
+    },
+    [api, baseNameFromKey, currentPath, editingValue, parentPathFromKey, pushToast, refresh]
+  );
+
   useEffect(() => {
     setList(null); // Clear list immediately when path changes
     refresh(currentPath);
   }, [currentPath, refresh]);
-
-  async function onCreateDir() {
-    if (!newDir.trim()) return;
-    if (creatingDir) return; // Prevent duplicate submissions
-    setCreatingDir(true);
-    const path = fullKey(newDir.trim(), true).replace(/\/$/, "");
-    const res = await api.createDir(path);
-    setCreatingDir(false);
-    if (!res.ok) {
-      pushToast("error", JSON.stringify(res.data));
-      return;
-    }
-    setNewDir("");
-    refresh(currentPath);
-  }
 
   async function uploadFiles(files: File[], targetPath?: string) {
     if (!files.length) return;
@@ -203,19 +314,8 @@ export default function StoragePanel() {
       `Uploaded ${files.length} file${files.length > 1 ? "s" : ""}.`
     );
     if (fileRef.current) fileRef.current.value = "";
-    setUploadPath("");
     setUploading(false);
     refresh(currentPath);
-  }
-
-  async function onUpload(e: React.FormEvent) {
-    e.preventDefault();
-    const files = fileRef.current?.files;
-    if (!files || !files.length) return;
-    const target = uploadPath.trim()
-      ? joinedPath(uploadPath.trim())
-      : currentPath;
-    await uploadFiles(Array.from(files), target || undefined);
   }
 
   async function onDelete(key: string) {
@@ -293,40 +393,104 @@ export default function StoragePanel() {
     setLogs((res.data as any).logs || []);
   }
 
-  async function onShare(key: string) {
-    const targetSub = window.prompt("Share with target_sub (e.g. auth0|...):");
-    if (!targetSub || !targetSub.trim()) return;
-
-    const permissionRaw = window.prompt(
-      'Permission? Type "read" or "read-write" (default: read):'
-    );
-    const permission =
-      permissionRaw && permissionRaw.trim() === "read-write"
-        ? "read-write"
-        : "read";
-
-    const expiresRaw = window.prompt(
-      "Expires in seconds? Leave empty for no expiry:"
-    );
-    const expires =
-      expiresRaw && expiresRaw.trim() !== "" ? Number(expiresRaw) : undefined;
-    const expiresValue =
-      typeof expires === "number" && Number.isFinite(expires) && expires > 0
-        ? expires
-        : undefined;
-
-    const res = await api.shareWithUser(
+  const openShare = useCallback((key: string, isDir: boolean) => {
+    setShareState({
       key,
-      targetSub.trim(),
-      permission,
-      expiresValue
-    );
+      isDir,
+      visibility: "private",
+      permission: "read",
+      targetEmail: "",
+      allowedEmails: "",
+      expiresIn: "",
+      result: null,
+    });
+  }, []);
+
+  const closeShare = useCallback(() => {
+    setShareLoading(false);
+    setShareState(null);
+  }, []);
+
+  async function submitShare() {
+    if (!shareState) return;
+    if (shareState.visibility === "private" && !shareState.targetEmail.trim()) {
+      pushToast("error", "Target email is required for private shares");
+      return;
+    }
+    if (shareState.visibility === "protected" && !shareState.allowedEmails.trim()) {
+      pushToast("error", "Provide at least one allowed email for protected shares");
+      return;
+    }
+
+    const expiresTrimmed = shareState.expiresIn.trim();
+    let expiresNumber: number | undefined;
+    if (expiresTrimmed) {
+      const parsed = Number(expiresTrimmed);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        pushToast("error", "Expiry must be a positive number of seconds");
+        return;
+      }
+      expiresNumber = parsed;
+    }
+
+    const allowedEmails = shareState.allowedEmails
+      .split(/[,\n]+/)
+      .map((e) => e.trim())
+      .filter(Boolean);
+
+    const payload = {
+      key: shareState.key,
+      visibility: shareState.visibility,
+      permission: shareState.permission,
+      target_email: shareState.targetEmail.trim() || undefined,
+      allowed_emails: allowedEmails,
+      expires_in: expiresNumber,
+    } as any;
+
+    setShareLoading(true);
+    const res = await api.createShare(payload);
+    setShareLoading(false);
+
     if (!res.ok) {
       pushToast("error", JSON.stringify(res.data));
       return;
     }
+
+    const result = res.data as ShareResult;
+    setShareState((prev) => (prev ? { ...prev, result } : prev));
     pushToast("success", "Share created");
   }
+
+  async function copyText(text: string, label = "Copied") {
+    try {
+      await navigator.clipboard.writeText(text);
+      pushToast("success", label);
+    } catch (err) {
+      const details = err instanceof Error ? err.message : String(err);
+      pushToast("error", "Could not copy", details);
+    }
+  }
+
+  const onNewFolder = useCallback(async () => {
+    if (creatingDir) return;
+    const name = computeUniqueFolderName();
+    const targetPath = fullKey(name, true).replace(/\/$/, "");
+
+    setCreatingDir(true);
+    const res = await api.createDir(targetPath);
+    setCreatingDir(false);
+
+    if (!res.ok) {
+      pushToast("error", JSON.stringify(res.data));
+      return;
+    }
+
+    await refresh(currentPath);
+    const newKey = fullKey(name, true);
+    setEditingKey(newKey);
+    setEditingValue(name);
+    setHoveredNameKey(newKey);
+  }, [api, computeUniqueFolderName, creatingDir, fullKey, pushToast, refresh, currentPath]);
 
   function handleDragOver(e: React.DragEvent) {
     e.preventDefault();
@@ -427,6 +591,60 @@ export default function StoragePanel() {
     ? currentPath.split("/").filter(Boolean)
     : [];
 
+  const renderNameField = useCallback(
+    (key: string, name: string, isDir: boolean, isHoveringName: boolean) => {
+      const isEditing = editingKey === key;
+      const showInput = isEditing;
+
+      if (showInput) {
+        return (
+          <input
+            ref={isEditing ? editInputRef : null}
+            value={isEditing ? editingValue : name}
+            readOnly={!isEditing}
+            onChange={
+              isEditing ? (e) => setEditingValue(e.target.value) : undefined
+            }
+            onClick={(e) => {
+              e.stopPropagation();
+              if (!isEditing) startRename(key, name);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                commitRename(key, isDir);
+              } else if (e.key === "Escape") {
+                setEditingKey(null);
+                setEditingValue("");
+              }
+            }}
+            onBlur={() => {
+              if (isEditing) commitRename(key, isDir);
+            }}
+            className={`w-full min-w-0 bg-transparent text-sm font-medium leading-none h-6 flex items-center rounded border px-0 py-0 transition ${
+              isEditing
+                ? "border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+                : "border-transparent"
+            }`}
+          />
+        );
+      }
+
+      return (
+        <p
+          className="text-sm font-medium cursor-text h-6 flex items-center"
+          onClick={(e) => {
+            e.stopPropagation();
+            startRename(key, name);
+          }}
+        >
+          {name}
+        </p>
+      );
+    },
+    [commitRename, editingKey, editingValue, startRename]
+  );
+
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
@@ -508,9 +726,9 @@ export default function StoragePanel() {
         </div>
       </div>
 
-      <div className="grid gap-4 lg:grid-cols-3">
+      <div className="grid gap-4">
         <div
-          className={`rounded-xl border-2 transition lg:col-span-2 ${
+          className={`rounded-xl border-2 transition ${
             dragActive
               ? "border-primary border-dashed bg-primary/5"
               : "border bg-card/60"
@@ -530,6 +748,19 @@ export default function StoragePanel() {
                 </p>
               </div>
               <div className="flex items-center gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={onNewFolder}
+                  disabled={creatingDir || loading}
+                >
+                  {creatingDir ? (
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  ) : (
+                    <FolderPlus className="mr-2 h-4 w-4" />
+                  )}
+                  New folder
+                </Button>
                 <input
                   type="file"
                   ref={fileRef}
@@ -581,6 +812,8 @@ export default function StoragePanel() {
                           ? "border-primary bg-primary/5"
                           : "hover:border-primary"
                       }`}
+                      role="button"
+                      tabIndex={0}
                       onDragOver={(e) => handleFolderDragOver(e, "..")}
                       onDragLeave={handleFolderDragLeave}
                       onDrop={(e) => {
@@ -596,14 +829,19 @@ export default function StoragePanel() {
                           moveItem(draggedItem.key, parentPath);
                         }
                       }}
-                    >
-                      <button
-                        className="flex items-center gap-3"
-                        onClick={() => {
+                      onClick={() => {
+                        const parts = currentPath.split("/").filter(Boolean);
+                        setCurrentPath(parts.slice(0, -1).join("/"));
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
                           const parts = currentPath.split("/").filter(Boolean);
                           setCurrentPath(parts.slice(0, -1).join("/"));
-                        }}
-                      >
+                        }
+                      }}
+                    >
+                      <div className="flex items-center gap-3">
                         <ArrowLeft className="h-4 w-4 text-muted-foreground" />
                         <div className="text-left">
                           <p className="text-sm font-medium">..</p>
@@ -611,150 +849,348 @@ export default function StoragePanel() {
                             Parent folder
                           </p>
                         </div>
-                      </button>
+                      </div>
                     </div>
                   )}
-                  {(list.directories || []).map((d) => (
-                    <div
-                      key={d.name}
-                      draggable
-                      onDragStart={(e) =>
-                        handleItemDragStart(e, "folder", fullKey(d.name, true))
-                      }
-                      onDragEnd={handleItemDragEnd}
-                      className={`group flex items-center justify-between rounded-lg border px-3 py-2 transition select-none cursor-pointer ${
-                        dragOverFolder === d.name
-                          ? "border-primary bg-primary/5"
-                          : "hover:border-primary"
-                      }`}
-                      onDragOver={(e) => handleFolderDragOver(e, d.name)}
-                      onDragLeave={handleFolderDragLeave}
-                      onDrop={(e) => handleFolderDrop(e, joinedPath(d.name))}
-                      onClick={() => setCurrentPath(joinedPath(d.name))}
-                    >
-                      <div className="flex items-center gap-3">
-                        <Folder className="h-4 w-4 text-primary" />
-                        <div className="text-left">
-                          <p className="text-sm font-medium">{d.name}</p>
-                          <p className="text-xs text-muted-foreground">
-                            Folder
-                          </p>
+                  {(list.directories || []).map((d) => {
+                    const dirKey = fullKey(d.name, true);
+                    return (
+                      <div
+                        key={dirKey}
+                        draggable={editingKey !== dirKey}
+                        onDragStart={(e) =>
+                          handleItemDragStart(e, "folder", dirKey)
+                        }
+                        onDragEnd={handleItemDragEnd}
+                        className={`group flex items-center justify-between rounded-lg border px-3 py-2 transition select-none cursor-pointer ${
+                          dragOverFolder === d.name
+                            ? "border-primary bg-primary/5"
+                            : "hover:border-primary"
+                        }`}
+                        onMouseEnter={() => setHoveredNameKey(dirKey)}
+                        onMouseLeave={() =>
+                          setHoveredNameKey((prev) =>
+                            prev === dirKey ? null : prev
+                          )
+                        }
+                        onDragOver={(e) => handleFolderDragOver(e, d.name)}
+                        onDragLeave={handleFolderDragLeave}
+                        onDrop={(e) => handleFolderDrop(e, joinedPath(d.name))}
+                        onClick={() => {
+                          if (editingKey === dirKey) return;
+                          setCurrentPath(joinedPath(d.name));
+                        }}
+                      >
+                        <div className="flex items-center gap-3">
+                          <Folder className="h-4 w-4 text-primary" />
+                          <div className="text-left">
+                            <div
+                              className="flex flex-col"
+                              onMouseEnter={() => setHoveredNameKey(dirKey)}
+                              onMouseLeave={() =>
+                                setHoveredNameKey((prev) =>
+                                  prev === dirKey ? null : prev
+                                )
+                              }
+                            >
+                              {renderNameField(
+                                dirKey,
+                                d.name,
+                                true,
+                                hoveredNameKey === dirKey
+                              )}
+                              <p className="text-xs text-muted-foreground">
+                                Folder
+                              </p>
+                            </div>
+                          </div>
+                        </div>
+                        <div
+                          className="flex items-center gap-2 opacity-0 transition group-hover:opacity-100"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          {!d.is_empty && (
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              onClick={() =>
+                                onDownloadFolderZip(joinedPath(d.name))
+                              }
+                              title="Download as ZIP"
+                            >
+                              <Download className="h-4 w-4" />
+                            </Button>
+                          )}
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            onClick={() => openShare(fullKey(d.name, true), true)}
+                          >
+                            <Share2 className="h-4 w-4" />
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            onClick={() => onDelete(fullKey(d.name, true))}
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </Button>
                         </div>
                       </div>
-                      <div
-                        className="flex items-center gap-2 opacity-0 transition group-hover:opacity-100"
-                        onClick={(e) => e.stopPropagation()}
-                      >
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          onClick={() =>
-                            onDownloadFolderZip(joinedPath(d.name))
-                          }
-                          title="Download as ZIP"
-                        >
-                          <Download className="h-4 w-4" />
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          onClick={() => onShare(fullKey(d.name, true))}
-                        >
-                          <Share2 className="h-4 w-4" />
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          onClick={() => onDelete(fullKey(d.name, true))}
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
-                      </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
 
                 <div className="grid gap-2">
-                  {(list.files || []).map((f) => (
-                    <div
-                      key={f.name}
-                      draggable
-                      onDragStart={(e) =>
-                        handleItemDragStart(e, "file", fullKey(f.name))
-                      }
-                      onDragEnd={handleItemDragEnd}
-                      className="group flex items-center justify-between rounded-lg border px-3 py-2 hover:border-primary select-none"
-                    >
-                      <div className="flex items-center gap-3">
-                        <div className="h-9 w-9 rounded-lg bg-primary/10 text-primary flex items-center justify-center text-xs font-semibold">
-                          {f.name.split(".").pop()?.toUpperCase().slice(0, 4) ||
-                            "FILE"}
+                  {(list.files || []).map((f) => {
+                    const fileKey = fullKey(f.name);
+                    return (
+                      <div
+                        key={fileKey}
+                        draggable={editingKey !== fileKey}
+                        onDragStart={(e) =>
+                          handleItemDragStart(e, "file", fileKey)
+                        }
+                        onDragEnd={handleItemDragEnd}
+                        className="group flex items-center justify-between rounded-lg border px-3 py-2 hover:border-primary select-none"
+                        onMouseEnter={() => setHoveredNameKey(fileKey)}
+                        onMouseLeave={() =>
+                          setHoveredNameKey((prev) =>
+                            prev === fileKey ? null : prev
+                          )
+                        }
+                      >
+                        <div className="flex items-center gap-3">
+                          <div className="h-9 w-9 rounded-lg bg-primary/10 text-primary flex items-center justify-center text-xs font-semibold">
+                            {f.name.split(".").pop()?.toUpperCase().slice(0, 4) ||
+                              "FILE"}
+                          </div>
+                          <div className="text-left">
+                            <div
+                              className="flex flex-col"
+                              onMouseEnter={() => setHoveredNameKey(fileKey)}
+                              onMouseLeave={() =>
+                                setHoveredNameKey((prev) =>
+                                  prev === fileKey ? null : prev
+                                )
+                              }
+                            >
+                              {renderNameField(
+                                fileKey,
+                                f.name,
+                                false,
+                                hoveredNameKey === fileKey
+                              )}
+                              <p className="text-xs text-muted-foreground">
+                                {formatBytes(f.size)}
+                              </p>
+                            </div>
+                          </div>
                         </div>
-                        <div className="text-left">
-                          <p className="text-sm font-medium">{f.name}</p>
-                          <p className="text-xs text-muted-foreground">
-                            {formatBytes(f.size)}
-                          </p>
+                        <div className="flex items-center gap-2 opacity-0 transition group-hover:opacity-100">
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            onClick={() => onDownload(fullKey(f.name))}
+                          >
+                            <Download className="h-4 w-4" />
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            onClick={() => onShowVersions(fullKey(f.name))}
+                          >
+                            <History className="h-4 w-4" />
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            onClick={() => openShare(fullKey(f.name), false)}
+                          >
+                            <Share2 className="h-4 w-4" />
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            onClick={() => onDelete(fullKey(f.name))}
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </Button>
                         </div>
                       </div>
-                      <div className="flex items-center gap-2 opacity-0 transition group-hover:opacity-100">
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          onClick={() => onDownload(fullKey(f.name))}
-                        >
-                          <Download className="h-4 w-4" />
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          onClick={() => onShowVersions(fullKey(f.name))}
-                        >
-                          <History className="h-4 w-4" />
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          onClick={() => onShare(fullKey(f.name))}
-                        >
-                          <Share2 className="h-4 w-4" />
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          onClick={() => onDelete(fullKey(f.name))}
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
-                      </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
+
+                {(!list.directories?.length && !list.files?.length) && (
+                  <div className="rounded-lg px-4 py-6 text-center text-sm text-muted-foreground">
+                    No files found
+                  </div>
+                )}
               </div>
             )}
           </div>
         </div>
 
-        <div className="rounded-xl border bg-card/60 p-4 shadow-sm">
-          <p className="text-sm font-semibold">New folder</p>
-          <p className="text-xs text-muted-foreground">
-            Created inside {currentPath || "root"}.
-          </p>
-          <div className="mt-3 flex flex-col gap-2">
-            <Input
-              placeholder="photos/2026"
-              value={newDir}
-              onChange={(e) => setNewDir(e.target.value)}
-            />
-            <Button onClick={onCreateDir} disabled={creatingDir}>
-              {creatingDir ? (
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-              ) : null}
-              {creatingDir ? "Creating..." : "Create"}
-            </Button>
+      </div>
+
+      {shareState && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 px-4 backdrop-blur-sm">
+          <div className="w-full max-w-xl space-y-4 rounded-xl border bg-card p-5 shadow-xl">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <p className="text-xs uppercase tracking-[0.2em] text-muted-foreground">
+                  Share
+                </p>
+                <p className="text-sm font-semibold break-all">{shareState.key}</p>
+              </div>
+              <Button variant="ghost" size="sm" onClick={closeShare}>
+                Close
+              </Button>
+            </div>
+
+            <div className="grid gap-3">
+              <div className="grid gap-2">
+                <label className="text-xs font-medium text-muted-foreground">
+                  Visibility
+                </label>
+                <select
+                  className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+                  value={shareState.visibility}
+                  onChange={(e) =>
+                    setShareState((prev) =>
+                      prev ? { ...prev, visibility: e.target.value as ShareVisibility, result: null } : prev
+                    )
+                  }
+                >
+                  <option value="private">Private (specific user)</option>
+                  <option value="public">Public link</option>
+                  <option value="protected">Protected (allowed emails)</option>
+                </select>
+              </div>
+
+              <div className="grid gap-2">
+                <label className="text-xs font-medium text-muted-foreground">
+                  Permission
+                </label>
+                <select
+                  className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+                  disabled={shareState.visibility !== "private" || shareState.isDir}
+                  value={shareState.permission}
+                  onChange={(e) =>
+                    setShareState((prev) =>
+                      prev ? { ...prev, permission: e.target.value as SharePermission, result: null } : prev
+                    )
+                  }
+                >
+                  <option value="read">Read only</option>
+                  <option value="read-write">Read &amp; write</option>
+                </select>
+                {shareState.visibility !== "private" && (
+                  <p className="text-xs text-muted-foreground">
+                    Public and protected links are limited to read-only.
+                  </p>
+                )}
+                {shareState.isDir && (
+                  <p className="text-xs text-muted-foreground">
+                    Directory shares are read-only and meant for browsing/zip downloads.
+                  </p>
+                )}
+              </div>
+
+              {shareState.visibility === "private" && (
+                <div className="grid gap-2">
+                  <label className="text-xs font-medium text-muted-foreground">Target email</label>
+                  <input
+                    className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+                    placeholder="user@example.com"
+                    value={shareState.targetEmail}
+                    onChange={(e) =>
+                      setShareState((prev) => (prev ? { ...prev, targetEmail: e.target.value, result: null } : prev))
+                    }
+                  />
+                </div>
+              )}
+
+              {shareState.visibility === "protected" && (
+                <div className="grid gap-2">
+                  <label className="text-xs font-medium text-muted-foreground">Allowed emails</label>
+                  <textarea
+                    className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+                    rows={3}
+                    placeholder="one@example.com, two@example.com"
+                    value={shareState.allowedEmails}
+                    onChange={(e) =>
+                      setShareState((prev) => (prev ? { ...prev, allowedEmails: e.target.value, result: null } : prev))
+                    }
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Comma or newline separated. Viewers must be logged in with a matching email.
+                  </p>
+                </div>
+              )}
+
+              <div className="grid gap-2">
+                <label className="text-xs font-medium text-muted-foreground">Expires in (seconds)</label>
+                <input
+                  type="number"
+                  min={1}
+                  className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+                  placeholder="Optional"
+                  value={shareState.expiresIn}
+                  onChange={(e) =>
+                    setShareState((prev) => (prev ? { ...prev, expiresIn: e.target.value, result: null } : prev))
+                  }
+                />
+              </div>
+            </div>
+
+            {shareState.result && (
+              <div className="grid gap-2 rounded-lg border bg-muted/40 p-3 text-sm">
+                <div className="flex items-center justify-between gap-2">
+                  <p className="font-medium">Share created</p>
+                  {shareState.result.expires_at && (
+                    <span className="text-xs text-muted-foreground">
+                      Expires {shareState.result.expires_at}
+                    </span>
+                  )}
+                </div>
+                {shareState.result.access_url && (
+                  <div className="flex flex-col gap-2">
+                    <span className="text-xs text-muted-foreground">Link</span>
+                    <div className="flex items-center gap-2">
+                      <div className="flex-1 truncate rounded-md border bg-background px-3 py-2 text-xs">
+                        {shareState.result.access_url}
+                      </div>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => copyText(shareState.result?.access_url || "", "Link copied")}
+                      >
+                        <Copy className="mr-1 h-4 w-4" /> Copy
+                      </Button>
+                    </div>
+                  </div>
+                )}
+                <div className="flex flex-col gap-1">
+                  <span className="text-xs text-muted-foreground">Token</span>
+                  <code className="rounded-md bg-background px-2 py-1 text-xs">{shareState.result.token}</code>
+                </div>
+              </div>
+            )}
+
+            <div className="flex items-center justify-end gap-2">
+              <Button variant="outline" onClick={closeShare}>
+                Cancel
+              </Button>
+              <Button onClick={submitShare} disabled={shareLoading}>
+                {shareLoading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                Create share
+              </Button>
+            </div>
           </div>
         </div>
-      </div>
+      )}
 
       {versions && selectedKey && (
         <div className="rounded-xl border bg-card/80 p-4 shadow-lg">

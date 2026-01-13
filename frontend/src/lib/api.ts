@@ -48,6 +48,13 @@ export function createApi(getToken: () => Promise<string>) {
       form.set('destination', destination);
       return request('/move', 'POST', form);
     },
+    rename: (source: string, destinationFolder: string, newName: string) => {
+      const form = new FormData();
+      form.set('source', source);
+      form.set('destination', destinationFolder);
+      form.set('new_name', newName);
+      return request('/move', 'POST', form);
+    },
     downloadLink: (key: string, expires = 300) => request(`/download?key=${encodeURIComponent(key)}&expires=${expires}`, 'GET'),
     downloadFolderZip: (path: string, expires = 300) => request(`/download-zip?path=${encodeURIComponent(path)}&expires=${expires}`, 'GET'),
     versions: (key: string) => request(`/versions?key=${encodeURIComponent(key)}`, 'GET'),
@@ -58,17 +65,46 @@ export function createApi(getToken: () => Promise<string>) {
       return request('/versions/restore', 'POST', form);
     },
     logs: (limit = 50) => request(`/logs?limit=${limit}`, 'GET'),
-    shareWithUser: (key: string, target_sub: string, permission: 'read' | 'read-write' = 'read', expires_in?: number) => {
+    createShare: (options: {
+      key: string;
+      visibility: 'private' | 'public' | 'protected';
+      permission?: 'read' | 'read-write';
+      target_email?: string;
+      target_sub?: string; // legacy fallback
+      allowed_emails?: string[];
+      expires_in?: number;
+    }) => {
+      const form = new FormData();
+      form.set('key', options.key);
+      form.set('visibility', options.visibility);
+      form.set('permission', options.permission || 'read');
+      if (options.target_email) form.set('target_email', options.target_email);
+      else if (options.target_sub) form.set('target_sub', options.target_sub);
+      if (options.allowed_emails && options.allowed_emails.length) {
+        form.set('allowed_emails', JSON.stringify(options.allowed_emails));
+      }
+      if (typeof options.expires_in === 'number') {
+        form.set('expires_in', String(options.expires_in));
+      }
+      return request('/share', 'POST', form);
+    },
+    shareWithUser: (key: string, target_email: string, permission: 'read' | 'read-write' = 'read', expires_in?: number) => {
       const form = new FormData();
       form.set('key', key);
-      form.set('target_sub', target_sub);
+      form.set('target_email', target_email);
       form.set('permission', permission);
       if (typeof expires_in === 'number') form.set('expires_in', String(expires_in));
       return request('/share/user', 'POST', form);
     },
     listShared: () => request('/shared', 'GET'),
     sharedDownload: (share_id: string, expires = 300) => request(`/shared/download?share_id=${encodeURIComponent(share_id)}&expires=${expires}`, 'GET'),
-    revokeShare: (share_id: string) => request(`/share?share_id=${encodeURIComponent(share_id)}`, 'DELETE'),
+    revokeShare: (share_id: string) => request(`/share/revoke?share_id=${encodeURIComponent(share_id)}`, 'DELETE'),
+    accessShare: (token: string, options?: { expires?: number; presign?: boolean; path?: string }) => {
+      const expires = options?.expires ?? 300;
+      const presign = options?.presign ?? true;
+      const pathParam = options?.path ? `&path=${encodeURIComponent(options.path)}` : '';
+      return request(`/share/access?token=${encodeURIComponent(token)}&expires=${expires}&presign=${presign ? 1 : 0}&format=json${pathParam}`, 'GET');
+    },
     multipart: {
       initiate: (filename: string, totalSize?: number, path?: string) => {
         const form = new FormData();

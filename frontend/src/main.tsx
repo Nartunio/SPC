@@ -8,6 +8,7 @@ import LandingPage from './pages/landing-page/LandingPage.tsx';
 import { BrowserRouter, Route, Routes } from 'react-router-dom';
 import { NoRoutePage } from './pages/no-route-page/NoRoutePage.tsx';
 import LoggedInPage from './pages/logged-in-page/LoggedInPage.tsx';
+import ShareAccessPage from './pages/share/ShareAccessPage.tsx';
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
@@ -17,6 +18,8 @@ createRoot(document.getElementById('root')!).render(
       authorizationParams={{
         redirect_uri: window.location.origin,
         audience: import.meta.env.VITE_AUTH0_AUDIENCE,
+        // Request refresh tokens for silent renewal
+        scope: 'openid profile email offline_access',
       }}
       useRefreshTokens={true}
       cacheLocation="localstorage"
@@ -25,6 +28,7 @@ createRoot(document.getElementById('root')!).render(
         <Routes>
           <Route path="/" element={<LandingPage />} />
           <Route path='/logged-in-page' element={<LoggedInPage />} />
+          <Route path='/share' element={<ShareAccessPage />} />
           <Route path="*" element={<NoRoutePage />} />
         </Routes>
       </BrowserRouter>

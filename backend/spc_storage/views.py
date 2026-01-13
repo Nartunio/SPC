@@ -1,17 +1,42 @@
 import boto3
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
-from django.http import JsonResponse, StreamingHttpResponse
+from django.http import JsonResponse, StreamingHttpResponse, HttpResponseRedirect, HttpResponse
 from django.views.decorators.http import require_http_methods
 from django.views.decorators.csrf import csrf_exempt
 from config import settings
-from spc_auth.auth import require_auth
+from spc_auth.auth import require_auth, token_validator
 from .models import ActivityLog, FileVersion, StorageShare
+from spc_auth.models import UserIdentity
+from django.db import models
+from typing import Optional
 from django.utils import timezone
 from datetime import timedelta
 import os
 import io
 import zipfile
+import json
+
+
+FRONTEND_SHARE_BASE = (
+    getattr(settings, "FRONTEND_SHARE_BASE", None)
+    or getattr(settings, "FRONTEND_ORIGIN", None)
+    or ("http://localhost:5173" if getattr(settings, "DEBUG", False) else None)
+)
+
+
+def _parse_allowed_emails(raw: str):
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return [str(e).strip().lower() for e in data if str(e).strip()]
+    except Exception:
+        pass
+    # fallback: comma or newline separated
+    parts = [p.strip() for p in raw.replace("\n", ",").split(",") if p.strip()]
+    return [p.lower() for p in parts]
 
 
 def _get_s3_client():
@@ -42,6 +67,105 @@ def _get_s3_client():
         client_kwargs["region_name"] = region
     client = session.client("s3", **client_kwargs)
     return client
+
+
+def _key_exists(s3, bucket: str, key: str) -> bool:
+    """Return True if the exact key exists in S3."""
+    try:
+        s3.head_object(Bucket=bucket, Key=key)
+        return True
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in ("404", "NotFound"):
+            return False
+        raise
+
+
+def _prefix_exists(s3, bucket: str, prefix: str) -> bool:
+    """Return True if there is at least one object (or marker) under the prefix."""
+    resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1)
+    return resp.get("KeyCount", 0) > 0
+
+
+def _is_prefix_empty(s3, bucket: str, prefix: str) -> bool:
+    """Heuristically determine if a prefix has no children besides its own marker."""
+    try:
+        resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=2)
+        count = resp.get("KeyCount", 0)
+        if count == 0:
+            return True
+        if count == 1:
+            contents = resp.get("Contents", [])
+            if contents:
+                only_key = contents[0].get("Key")
+                if only_key == prefix:
+                    return True
+        return False
+    except ClientError:
+        # If we cannot determine, err on the side of treating it as non-empty so download remains available.
+        return False
+
+
+def _zip_prefix_to_bytes(s3, bucket: str, prefix: str) -> bytes:
+    """Create an in-memory zip for all objects under the prefix (excluding marker)."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
+        continuation = None
+        while True:
+            list_kwargs = {"Bucket": bucket, "Prefix": prefix}
+            if continuation:
+                list_kwargs["ContinuationToken"] = continuation
+            resp = s3.list_objects_v2(**list_kwargs)
+            for obj in resp.get("Contents", []):
+                key = obj.get("Key")
+                if not key or key == prefix:
+                    continue
+                relative_path = key[len(prefix):]
+                if not relative_path:
+                    continue
+                try:
+                    file_obj = s3.get_object(Bucket=bucket, Key=key)
+                    zf.writestr(relative_path, file_obj['Body'].read())
+                except ClientError:
+                    # skip unreadable objects but keep building zip
+                    continue
+            if resp.get("IsTruncated"):
+                continuation = resp.get("NextContinuationToken")
+            else:
+                break
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def _key_or_prefix_exists(s3, bucket: str, full_key: str) -> bool:
+    if full_key.endswith("/"):
+        return _prefix_exists(s3, bucket, full_key)
+    return _key_exists(s3, bucket, full_key)
+
+
+def _optional_claims(request):
+    auth_header = request.META.get("HTTP_AUTHORIZATION") or request.headers.get("Authorization")
+    if not auth_header or not auth_header.lower().startswith("bearer "):
+        return None
+    token_str = auth_header.split(" ", 1)[1]
+    try:
+        token = token_validator.authenticate_token(token_str)
+        return dict(token)
+    except Exception:
+        return None
+
+
+def _record_identity(claims):
+    if not claims:
+        return
+    email = claims.get("email")
+    sub = claims.get("sub")
+    if not email or not sub:
+        return
+    email_l = str(email).lower()
+    try:
+        UserIdentity.objects.get_or_create(sub=sub, defaults={"email": email_l})
+    except Exception:
+        pass
 
 
 @require_auth(None)
@@ -89,7 +213,10 @@ def get_files(request):
         prefix = p.get("Prefix", "")
         name = prefix[len(current_prefix):].rstrip("/")
         if name:
-            directories.append({"name": name})
+            directories.append({
+                "name": name,
+                "is_empty": _is_prefix_empty(s3, bucket, prefix),
+            })
 
     files = []
     for obj in resp.get("Contents", []):
@@ -206,7 +333,6 @@ def upload_file(request):
         # If key exists, create a version backup before overwrite
         try:
             head = s3.head_object(Bucket=bucket, Key=key)
-            # Determine next version
             logical = key[len(user_prefix):]
             latest = FileVersion.objects.filter(owner_sub=claims['sub'], key=logical).order_by("-version").first()
             next_version = (latest.version + 1) if latest else 1
@@ -214,8 +340,12 @@ def upload_file(request):
             version_key = f"{name}.v{next_version}{ext}"
             s3.copy_object(Bucket=bucket, CopySource={"Bucket": bucket, "Key": key}, Key=version_key)
             FileVersion.objects.create(
-                owner_sub=claims['sub'], key=logical, version=next_version, object_key=version_key,
-                size=head.get("ContentLength"), etag=head.get("ETag")
+                owner_sub=claims['sub'],
+                key=logical,
+                version=next_version,
+                object_key=version_key,
+                size=head.get("ContentLength"),
+                etag=head.get("ETag"),
             )
         except ClientError:
             # Doesn't exist; proceed
@@ -223,64 +353,16 @@ def upload_file(request):
 
         extra = {"ContentType": getattr(file_obj, "content_type", None) or "application/octet-stream"}
         s3.upload_fileobj(file_obj, bucket, key, ExtraArgs=extra)
-        ActivityLog.objects.create(user_sub=claims['sub'], action="upload", key=key, success=True, extra={"size": getattr(file_obj, "size", None)})
+        ActivityLog.objects.create(
+            user_sub=claims['sub'],
+            action="upload",
+            key=key,
+            success=True,
+            extra={"size": getattr(file_obj, "size", None)},
+        )
         return JsonResponse({"uploaded": True, "key": key})
     except ClientError as e:
         ActivityLog.objects.create(user_sub=claims['sub'], action="upload", key=key, success=False, extra={"error": str(e)})
-        return JsonResponse({"error": "s3_error", "details": str(e)}, status=502)
-
-
-@require_auth(None)
-@csrf_exempt
-@require_http_methods(["DELETE"])
-def delete_item(request):
-    bucket = settings.S3_BUCKET
-    if not bucket:
-        return JsonResponse({"error": "s3_not_configured"}, status=500)
-
-    try:
-        s3 = _get_s3_client()
-    except Exception as e:
-        return JsonResponse({"error": "s3_client_error", "details": str(e)}, status=500)
-
-    user_prefix = _user_prefix_from_request(request)
-    claims = dict(getattr(request, "oauth_token", {}))
-    # Support key from query string or form
-    raw_key = request.GET.get("key") or request.POST.get("key") or ""
-    subkey = _sanitize_subpath(raw_key)
-    if not subkey:
-        return JsonResponse({"error": "missing_key"}, status=400)
-
-    key = f"{user_prefix}{subkey}"
-
-    try:
-        if key.endswith("/"):
-            # delete all objects under this prefix (simulate directory delete)
-            continuation = None
-            deleted = 0
-            while True:
-                list_kwargs = {"Bucket": bucket, "Prefix": key}
-                if continuation:
-                    list_kwargs["ContinuationToken"] = continuation
-                resp = s3.list_objects_v2(**list_kwargs)
-                contents = resp.get("Contents", [])
-                if not contents:
-                    break
-                to_delete = [{"Key": obj["Key"]} for obj in contents]
-                s3.delete_objects(Bucket=bucket, Delete={"Objects": to_delete})
-                deleted += len(to_delete)
-                if resp.get("IsTruncated"):
-                    continuation = resp.get("NextContinuationToken")
-                else:
-                    break
-            ActivityLog.objects.create(user_sub=claims['sub'], action="delete_prefix", key=key, success=True, extra={"deleted": deleted})
-            return JsonResponse({"deleted_prefix": key, "deleted_count": deleted})
-        else:
-            s3.delete_object(Bucket=bucket, Key=key)
-            ActivityLog.objects.create(user_sub=claims['sub'], action="delete", key=key, success=True)
-            return JsonResponse({"deleted": True, "key": key})
-    except ClientError as e:
-        ActivityLog.objects.create(user_sub=claims['sub'], action="delete", key=key, success=False, extra={"error": str(e)})
         return JsonResponse({"error": "s3_error", "details": str(e)}, status=502)
 
 
@@ -303,6 +385,7 @@ def move_item(request):
     # Get source and destination from POST data (FormData)
     source_key = (request.POST.get("source") or "").strip()
     dest_folder = (request.POST.get("destination") or "").strip()
+    new_name_raw = (request.POST.get("new_name") or "").strip()
 
     # IMPORTANT: _sanitize_subpath removes trailing '/', but we need it to
     # distinguish folders from files (S3 "folder" marker keys end with '/').
@@ -318,6 +401,15 @@ def move_item(request):
 
     source = f"{user_prefix}{source_subkey}"
     
+    # Optional rename support
+    item_name_override = None
+    if new_name_raw:
+        new_name = _sanitize_subpath(new_name_raw)
+        # Reject names that resolve to nested paths
+        if not new_name or "/" in new_name:
+            return JsonResponse({"error": "invalid_new_name"}, status=400)
+        item_name_override = new_name
+
     # Build destination key
     if dest_subpath:
         dest_prefix = f"{user_prefix}{dest_subpath}"
@@ -327,7 +419,7 @@ def move_item(request):
         dest_prefix = user_prefix
     
     # Extract the item name from source
-    item_name = source_subkey.rstrip("/").split("/")[-1]
+    item_name = item_name_override or source_subkey.rstrip("/").split("/")[-1]
     destination = f"{dest_prefix}{item_name}{'/' if is_directory else ''}"
     
     # Avoid moving to same location
@@ -351,12 +443,19 @@ def move_item(request):
                 
                 for obj in contents:
                     old_key = obj["Key"]
-                    # Skip folder markers (keys ending with /)
-                    if old_key.endswith("/"):
-                        continue
                     # Replace prefix (source and destination are both prefixes ending with '/')
                     new_key = old_key.replace(source, destination, 1)
-                    # Copy object with error handling
+
+                    # Folder markers: recreate marker at destination, then delete old marker
+                    if old_key.endswith("/"):
+                        try:
+                            s3.put_object(Bucket=bucket, Key=new_key)
+                            s3.delete_object(Bucket=bucket, Key=old_key)
+                        except ClientError as copy_error:
+                            failed.append({"key": old_key, "error": str(copy_error)})
+                        continue
+
+                    # Regular objects: copy then delete
                     try:
                         s3.copy_object(
                             Bucket=bucket,
@@ -640,18 +739,33 @@ def list_logs(request):
     return JsonResponse({"logs": data})
 
 
-@require_auth(None)
-@csrf_exempt
-@require_http_methods(["POST"])
-def share_with_user(request):
-    token = getattr(request, "oauth_token", None)
-    claims = dict(token)
-    key = _sanitize_subpath(request.POST.get("key", ""))
-    target_sub = request.POST.get("target_sub")
-    permission = request.POST.get("permission", "read")
-    expires_in = request.POST.get("expires_in")
-    if not key or not target_sub:
-        return JsonResponse({"error": "missing_params"}, status=400)
+def _build_share_payload(share: StorageShare):
+    return {
+        "share_id": str(share.id),
+        "key": share.key,
+        "target_sub": share.target_sub,
+        "target_email": share.target_email,
+        "permission": share.permission,
+        "expires_at": share.expires_at.isoformat() if share.expires_at else None,
+        "visibility": share.visibility,
+        "token": share.token,
+        "allowed_emails": share.allowed_emails,
+        "is_directory": share.is_directory,
+        "owner_sub": share.owner_sub,
+    }
+
+
+def _create_share(owner_sub: str, key: str, permission: str, visibility: str, target_sub: Optional[str], target_email: Optional[str], allowed_emails: list[str], expires_in: Optional[str]):
+    if visibility not in ("private", "public", "protected"):
+        return None, JsonResponse({"error": "invalid_visibility"}, status=400)
+
+    if permission not in ("read", "read-write"):
+        return None, JsonResponse({"error": "invalid_permission"}, status=400)
+
+    # Restrict broad shares to read-only
+    if visibility in ("public", "protected") and permission != "read":
+        return None, JsonResponse({"error": "permission_not_allowed_for_visibility"}, status=400)
+
     is_dir = key.endswith("/")
     expires_at = None
     if expires_in:
@@ -659,12 +773,320 @@ def share_with_user(request):
             seconds = int(expires_in)
             expires_at = timezone.now() + timedelta(seconds=seconds)
         except ValueError:
-            pass
+            return None, JsonResponse({"error": "invalid_expires"}, status=400)
+
+    if visibility == "public":
+        target_sub = None
+        target_email = None
+        allowed_emails = []
+    elif visibility == "protected":
+        target_sub = None
+        target_email = None
+        allowed_emails = allowed_emails or []
+
     share = StorageShare.objects.create(
-        owner_sub=claims['sub'], target_sub=target_sub, key=key, is_directory=is_dir, permission=permission, expires_at=expires_at
+        owner_sub=owner_sub,
+        target_sub=target_sub,
+        target_email=target_email.lower() if target_email else None,
+        key=key,
+        is_directory=is_dir,
+        permission=permission,
+        visibility=visibility,
+        allowed_emails=allowed_emails,
+        expires_at=expires_at,
     )
-    ActivityLog.objects.create(user_sub=claims['sub'], action="share_create", key=key, success=True, extra={"target_sub": target_sub})
-    return JsonResponse({"share_id": str(share.id), "key": key, "target_sub": target_sub, "permission": permission, "expires_at": share.expires_at.isoformat() if share.expires_at else None})
+    return share, None
+
+
+@require_auth(None)
+@csrf_exempt
+@require_http_methods(["POST"])
+def share_with_user(request):
+    token = getattr(request, "oauth_token", None)
+    claims = dict(token)
+    _record_identity(claims)
+    raw_key = request.POST.get("key", "") or ""
+    is_dir = raw_key.endswith("/")
+    sanitized = _sanitize_subpath(raw_key).rstrip("/") if is_dir else _sanitize_subpath(raw_key)
+    key = f"{sanitized}/" if is_dir else sanitized
+    target_sub = request.POST.get("target_sub")
+    target_email = (request.POST.get("target_email") or "").strip().lower()
+    if not target_email and target_sub:
+        identity = UserIdentity.objects.filter(sub=target_sub).first()
+        if identity:
+            target_email = identity.email
+    permission = request.POST.get("permission", "read")
+    expires_in = request.POST.get("expires_in")
+    if not key or not (target_email or target_sub):
+        return JsonResponse({"error": "missing_params"}, status=400)
+    if not target_email:
+        return JsonResponse({"error": "target_email_required"}, status=400)
+
+    bucket = settings.S3_BUCKET
+    if not bucket:
+        return JsonResponse({"error": "s3_not_configured"}, status=500)
+    try:
+        s3 = _get_s3_client()
+    except Exception as e:
+        return JsonResponse({"error": "s3_client_error", "details": str(e)}, status=500)
+
+    owner_prefix = f"{claims['sub']}/"
+    full_key = f"{owner_prefix}{key}"
+    if key.endswith("/"):
+        if not _prefix_exists(s3, bucket, full_key):
+            # allow sharing empty directories by creating a marker
+            try:
+                s3.put_object(Bucket=bucket, Key=full_key)
+            except ClientError:
+                pass
+    else:
+        if not _key_exists(s3, bucket, full_key):
+            return JsonResponse({"error": "not_found"}, status=404)
+
+    share, error = _create_share(
+        owner_sub=claims['sub'],
+        key=key,
+        permission=permission,
+        visibility="private",
+        target_sub=None,
+        target_email=target_email,
+        allowed_emails=[],
+        expires_in=expires_in,
+    )
+    if error:
+        return error
+
+    ActivityLog.objects.create(user_sub=claims['sub'], action="share_create", key=key, success=True, extra={"target_sub": target_sub, "visibility": "private"})
+    return JsonResponse(_build_share_payload(share))
+
+
+@require_auth(None)
+@csrf_exempt
+@require_http_methods(["POST"])
+def create_share(request):
+    claims = dict(getattr(request, "oauth_token", {}))
+    _record_identity(claims)
+    raw_key = request.POST.get("key", "") or ""
+    is_dir = raw_key.endswith("/")
+    sanitized = _sanitize_subpath(raw_key).rstrip("/") if is_dir else _sanitize_subpath(raw_key)
+    key = f"{sanitized}/" if is_dir else sanitized
+    visibility = request.POST.get("visibility", "private")
+    permission = request.POST.get("permission", "read")
+    target_sub = request.POST.get("target_sub")
+    target_email_raw = request.POST.get("target_email") or ""
+    allowed_emails_raw = request.POST.get("allowed_emails") or ""
+    expires_in = request.POST.get("expires_in")
+
+    if not key:
+        return JsonResponse({"error": "missing_key"}, status=400)
+
+    parsed_emails = _parse_allowed_emails(allowed_emails_raw)
+    target_email = target_email_raw.strip().lower()
+    if visibility == "private":
+        if not target_email and target_sub:
+            identity = UserIdentity.objects.filter(sub=target_sub).first()
+            if identity:
+                target_email = identity.email
+        if not target_email:
+            return JsonResponse({"error": "target_email_required"}, status=400)
+    if visibility == "protected" and not parsed_emails:
+        return JsonResponse({"error": "allowed_emails_required"}, status=400)
+
+    bucket = settings.S3_BUCKET
+    try:
+        s3 = _get_s3_client()
+    except Exception as e:
+        return JsonResponse({"error": "s3_client_error", "details": str(e)}, status=500)
+
+    owner_prefix = f"{claims['sub']}/"
+    full_key = f"{owner_prefix}{key}"
+    if key.endswith("/"):
+        if not _prefix_exists(s3, bucket, full_key):
+            # allow sharing empty directories by creating a marker
+            try:
+                s3.put_object(Bucket=bucket, Key=full_key)
+            except ClientError:
+                pass
+    else:
+        if not _key_exists(s3, bucket, full_key):
+            return JsonResponse({"error": "not_found"}, status=404)
+
+    share, error = _create_share(
+        owner_sub=claims['sub'],
+        key=key,
+        permission=permission,
+        visibility=visibility,
+        target_sub=None,
+        target_email=target_email,
+        allowed_emails=parsed_emails,
+        expires_in=expires_in,
+    )
+    if error:
+        return error
+
+    payload = _build_share_payload(share)
+    payload["access_url"] = request.build_absolute_uri(f"/storage/share/access?token={share.token}")
+    ActivityLog.objects.create(
+        user_sub=claims['sub'],
+        action="share_create",
+        key=key,
+        success=True,
+        extra={"visibility": visibility, "target_sub": target_sub, "allowed_emails": parsed_emails},
+    )
+    return JsonResponse(payload)
+
+
+@csrf_exempt
+@require_http_methods(["GET"])
+def access_share(request):
+    token_param = request.GET.get("token")
+    if not token_param:
+        return JsonResponse({"error": "missing_token"}, status=400)
+
+    # Redirect to the frontend share viewer when configured, unless format=json is explicitly requested
+    if FRONTEND_SHARE_BASE and request.GET.get("format") != "json":
+        target = f"{FRONTEND_SHARE_BASE.rstrip('/')}/share?token={token_param}"
+        return HttpResponseRedirect(target)
+
+    share = StorageShare.objects.filter(token=token_param).first()
+    if not share:
+        return JsonResponse({"error": "not_found"}, status=404)
+
+    if share.visibility == "private":
+        return JsonResponse({"error": "private_share_use_authenticated_flow"}, status=403)
+
+    if share.expires_at and share.expires_at <= timezone.now():
+        return JsonResponse({"error": "share_expired"}, status=403)
+
+    claims = _optional_claims(request)
+    _record_identity(claims)
+    viewer_email = (claims or {}).get("email") or (claims or {}).get("emails")
+    if isinstance(viewer_email, list):
+        viewer_email = viewer_email[0] if viewer_email else None
+    if isinstance(viewer_email, str):
+        viewer_email = viewer_email.lower()
+
+    if share.visibility == "protected":
+        if not claims:
+            return JsonResponse({"error": "auth_required", "visibility": share.visibility, "is_directory": share.is_directory, "requires_auth": True}, status=401)
+        if not viewer_email:
+            return JsonResponse({"error": "email_required", "visibility": share.visibility, "is_directory": share.is_directory, "requires_auth": True}, status=403)
+        allowed = [e.lower() for e in (share.allowed_emails or [])]
+        if viewer_email.lower() not in allowed:
+            return JsonResponse({"error": "email_not_allowed", "visibility": share.visibility, "is_directory": share.is_directory, "requires_auth": False}, status=403)
+
+    bucket = settings.S3_BUCKET
+    if not bucket:
+        return JsonResponse({"error": "s3_not_configured"}, status=500)
+
+    try:
+        s3 = _get_s3_client()
+    except Exception as e:
+        return JsonResponse({"error": "s3_client_error", "details": str(e)}, status=500)
+
+    full_key = f"{share.owner_sub}/{share.key}"
+
+    payload = {
+        "key": share.key,
+        "visibility": share.visibility,
+        "is_directory": share.is_directory,
+        "expires_at": share.expires_at.isoformat() if share.expires_at else None,
+        "owner_sub": share.owner_sub,
+        "allowed": True,
+    }
+
+    if share.is_directory or full_key.endswith("/"):
+        # Directory sharing: browse or download as zip
+        if request.GET.get("zip") == "1":
+            folder_name = (share.key.rstrip("/").split("/")[-1]) or "folder"
+            zip_bytes = _zip_prefix_to_bytes(s3, bucket, full_key)
+            ActivityLog.objects.create(
+                user_sub=share.owner_sub,
+                action="share_access_zip",
+                key=share.key,
+                success=True,
+                extra={"visibility": share.visibility, "viewer_email": viewer_email},
+            )
+            response = HttpResponse(zip_bytes, content_type='application/zip')
+            response['Content-Disposition'] = f'attachment; filename="{folder_name}.zip"'
+            response['Content-Length'] = str(len(zip_bytes))
+            return response
+
+        rel_path = _sanitize_subpath(request.GET.get("path", "")).rstrip("/")
+        browse_prefix = f"{full_key}{rel_path + '/' if rel_path else ''}"
+        try:
+            resp = s3.list_objects_v2(Bucket=bucket, Prefix=browse_prefix, Delimiter="/")
+        except ClientError as e:
+            return JsonResponse({"error": "s3_error", "details": str(e)}, status=502)
+
+        directories = []
+        for p in resp.get("CommonPrefixes", []):
+            prefix = p.get("Prefix", "")
+            name = prefix[len(browse_prefix):].rstrip("/")
+            if name:
+                directories.append({"name": name})
+
+        files = []
+        for obj in resp.get("Contents", []):
+            key = obj.get("Key", "")
+            if key.endswith("/"):
+                continue
+            name = key[len(browse_prefix):]
+            if "/" in name:
+                continue
+            presigned = s3.generate_presigned_url(
+                ClientMethod="get_object",
+                Params={
+                    "Bucket": bucket,
+                    "Key": key,
+                    "ResponseContentDisposition": f"attachment; filename=\"{name}\"",
+                },
+                ExpiresIn=int(request.GET.get("expires", 300)),
+            )
+            files.append({
+                "name": name,
+                "size": obj.get("Size"),
+                "last_modified": obj.get("LastModified").isoformat() if obj.get("LastModified") else None,
+                "url": presigned,
+            })
+
+        payload.update({
+            "path": rel_path,
+            "directories": directories,
+            "files": files,
+            "zip_url": request.build_absolute_uri(f"/storage/share/access?token={token_param}&zip=1&format=json") if (directories or files) else None,
+        })
+        return JsonResponse(payload)
+
+    if not _key_exists(s3, bucket, full_key):
+        payload.update({"allowed": False, "reason": "not_found"})
+        return JsonResponse(payload, status=404)
+
+    try:
+        include_url = request.GET.get("presign", "1") != "0"
+        url = None
+        if include_url:
+            download_name = share.key.split("/")[-1] or "file"
+            url = s3.generate_presigned_url(
+                ClientMethod="get_object",
+                Params={
+                    "Bucket": bucket,
+                    "Key": full_key,
+                    "ResponseContentDisposition": f"attachment; filename=\"{download_name}\"",
+                },
+                ExpiresIn=int(request.GET.get("expires", 300)),
+            )
+        ActivityLog.objects.create(
+            user_sub=share.owner_sub,
+            action="share_access",
+            key=share.key,
+            success=True,
+            extra={"visibility": share.visibility, "viewer_email": viewer_email},
+        )
+        payload.update({"url": url} if url else {})
+        return JsonResponse(payload)
+    except ClientError as e:
+        return JsonResponse({"error": "s3_error", "details": str(e)}, status=502)
 
 
 @require_auth(None)
@@ -672,10 +1094,17 @@ def share_with_user(request):
 def list_shared_with_me(request):
     token = getattr(request, "oauth_token", None)
     claims = dict(token)
+    _record_identity(claims)
+    viewer_email = str(claims.get('email', '')).lower() if claims.get('email') else None
     now = timezone.now()
-    shares = StorageShare.objects.filter(target_sub=claims['sub']).filter(models.Q(expires_at__isnull=True) | models.Q(expires_at__gt=now))
+    qs = StorageShare.objects.filter(visibility="private")
+    if viewer_email:
+        qs = qs.filter(models.Q(target_email=viewer_email) | models.Q(target_sub=claims['sub']))
+    else:
+        qs = qs.filter(target_sub=claims['sub'])
+    shares = qs.filter(models.Q(expires_at__isnull=True) | models.Q(expires_at__gt=now))
     data = [
-        {"share_id": str(s.id), "owner_sub": s.owner_sub, "key": s.key, "is_directory": s.is_directory, "permission": s.permission, "expires_at": s.expires_at.isoformat() if s.expires_at else None}
+        {"share_id": str(s.id), "owner_sub": s.owner_sub, "key": s.key, "is_directory": s.is_directory, "permission": s.permission, "expires_at": s.expires_at.isoformat() if s.expires_at else None, "target_email": s.target_email}
         for s in shares
     ]
     return JsonResponse({"shares": data})
@@ -707,10 +1136,16 @@ def shared_download_link(request):
         return JsonResponse({"error": "s3_not_configured"}, status=500)
     token = getattr(request, "oauth_token", None)
     claims = dict(token)
+    _record_identity(claims)
+    viewer_email = str(claims.get('email', '')).lower() if claims.get('email') else None
     share_id = request.GET.get("share_id")
     if not share_id:
         return JsonResponse({"error": "missing_share_id"}, status=400)
-    share = StorageShare.objects.filter(id=share_id, target_sub=claims['sub']).first()
+    filters = {"id": share_id, "visibility": "private"}
+    if viewer_email:
+        share = StorageShare.objects.filter(models.Q(target_email=viewer_email) | models.Q(target_sub=claims['sub']), **filters).first()
+    else:
+        share = StorageShare.objects.filter(target_sub=claims['sub'], **filters).first()
     if not share:
         return JsonResponse({"error": "not_found"}, status=404)
     if share.expires_at and share.expires_at <= timezone.now():
@@ -865,4 +1300,62 @@ def multipart_abort(request):
         s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)
         return JsonResponse({"aborted": True})
     except ClientError as e:
+        return JsonResponse({"error": "s3_error", "details": str(e)}, status=502)
+
+
+@require_auth(None)
+@csrf_exempt
+@require_http_methods(["DELETE"])
+def delete_item(request):
+    bucket = settings.S3_BUCKET
+    if not bucket:
+        return JsonResponse({"error": "s3_not_configured"}, status=500)
+
+    try:
+        s3 = _get_s3_client()
+    except Exception as e:
+        return JsonResponse({"error": "s3_client_error", "details": str(e)}, status=500)
+
+    user_prefix = _user_prefix_from_request(request)
+    claims = dict(getattr(request, "oauth_token", {}))
+
+    raw_key = request.GET.get("key") or request.POST.get("key") or ""
+    is_dir_request = raw_key.endswith("/")
+    subkey = _sanitize_subpath(raw_key)
+    if is_dir_request and subkey:
+        subkey = f"{subkey}/"
+    if not subkey:
+        return JsonResponse({"error": "missing_key"}, status=400)
+
+    key = f"{user_prefix}{subkey}"
+
+    try:
+        if key.endswith("/"):
+            continuation = None
+            deleted = 0
+            while True:
+                list_kwargs = {"Bucket": bucket, "Prefix": key}
+                if continuation:
+                    list_kwargs["ContinuationToken"] = continuation
+                resp = s3.list_objects_v2(**list_kwargs)
+                contents = resp.get("Contents", [])
+                if not contents:
+                    break
+                to_delete = [{"Key": obj["Key"]} for obj in contents]
+                s3.delete_objects(Bucket=bucket, Delete={"Objects": to_delete})
+                deleted += len(to_delete)
+                if resp.get("IsTruncated"):
+                    continuation = resp.get("NextContinuationToken")
+                else:
+                    break
+            ActivityLog.objects.create(
+                user_sub=claims['sub'], action="delete_prefix", key=key, success=True, extra={"deleted": deleted}
+            )
+            return JsonResponse({"deleted_prefix": key, "deleted_count": deleted})
+        else:
+            s3.delete_object(Bucket=bucket, Key=key)
+            ActivityLog.objects.create(user_sub=claims['sub'], action="delete", key=key, success=True)
+            return JsonResponse({"deleted": True, "key": key})
+    except ClientError as e:
+        ActivityLog.objects.create(user_sub=claims['sub'], action="delete", key=key, success=False, extra={"error": str(e)})
         return JsonResponse({"error": "s3_error", "details": str(e)}, status=502)
