@@ -145,6 +145,21 @@ CORS_ALLOWED_ORIGINS = [
 # Allow cross-site cookies for API calls when credentials are included
 CORS_ALLOW_CREDENTIALS = True
 
+# Allow the frontend to send an Auth0 ID token alongside the API access token.
+# This enables the backend to read email/sub reliably even when the access token
+# for the custom API does not include an email claim.
+try:
+    from corsheaders.defaults import default_headers
+
+    CORS_ALLOW_HEADERS = list(default_headers) + [
+        "x-auth0-id-token",
+        "x-auth0-user-email",
+        "x-auth0-user-sub",
+    ]
+except Exception:
+    # If corsheaders defaults import changes, keep running with defaults.
+    pass
+
 # Trust the frontend origins for CSRF when using cookie-based auth in dev
 CSRF_TRUSTED_ORIGINS = [
     "http://localhost:5173",

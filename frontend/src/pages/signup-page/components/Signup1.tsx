@@ -1,5 +1,6 @@
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Link } from "react-router-dom";
 
 interface Signup1Props {
   heading?: string;
@@ -66,12 +67,9 @@ const Signup1 = ({
           </div>
           <div className="text-muted-foreground flex justify-center gap-1 text-sm">
             <p>{signupText}</p>
-            <a
-              href={signupUrl}
-              className="text-primary font-medium hover:underline"
-            >
+            <Link to={signupUrl} className="text-primary font-medium hover:underline">
               Zaloguj się
-            </a>
+            </Link>
           </div>
         </div>
       </div>

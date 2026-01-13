@@ -1,17 +1,29 @@
 export type HttpMethod = 'GET' | 'POST' | 'DELETE';
 
-export function createApi(getToken: () => Promise<string>) {
+export function createApi(getToken: () => Promise<string>, getIdTokenRaw?: () => Promise<string | undefined>) {
   const base = (import.meta as any).env.VITE_API_BASE || 'http://localhost:8000';
   const baseUrl = base.replace(/\/$/, '') + '/storage';
 
-  async function request(path: string, method: HttpMethod, body?: any, headers?: Record<string, string>) {
+  async function request(
+    path: string,
+    method: HttpMethod,
+    body?: any,
+    headers?: Record<string, string>,
+    options?: { signal?: AbortSignal }
+  ) {
     const token = await getToken();
+    let idToken: string | undefined;
+    if (getIdTokenRaw) {
+      try { idToken = await getIdTokenRaw(); } catch { idToken = undefined; }
+    }
     const url = `${baseUrl}${path}`;
     const res = await fetch(url, {
       method,
+      signal: options?.signal,
       headers: {
         ...(headers || {}),
         Authorization: `Bearer ${token}`,
+        ...(idToken ? { 'X-Auth0-Id-Token': idToken } : {}),
       },
       body,
     });
@@ -64,7 +76,13 @@ export function createApi(getToken: () => Promise<string>) {
       form.set('version', String(version));
       return request('/versions/restore', 'POST', form);
     },
-    logs: (limit = 50) => request(`/logs?limit=${limit}`, 'GET'),
+    logs: (limit = 50, offset = 0, action?: string, from?: string, to?: string) => {
+      const off = Number.isFinite(offset) && offset > 0 ? `&offset=${offset}` : '';
+      const act = action ? `&action=${encodeURIComponent(action)}` : '';
+      const fromQ = from ? `&from=${encodeURIComponent(from)}` : '';
+      const toQ = to ? `&to=${encodeURIComponent(to)}` : '';
+      return request(`/logs?limit=${limit}${off}${act}${fromQ}${toQ}`, 'GET');
+    },
     createShare: (options: {
       key: string;
       visibility: 'private' | 'public' | 'protected';
@@ -88,6 +106,10 @@ export function createApi(getToken: () => Promise<string>) {
       }
       return request('/share', 'POST', form);
     },
+    listOwnedShares: (prefix?: string) => {
+      const query = prefix ? `?prefix=${encodeURIComponent(prefix)}` : '';
+      return request(`/share/list${query}`, 'GET');
+    },
     shareWithUser: (key: string, target_email: string, permission: 'read' | 'read-write' = 'read', expires_in?: number) => {
       const form = new FormData();
       form.set('key', key);
@@ -99,11 +121,15 @@ export function createApi(getToken: () => Promise<string>) {
     listShared: () => request('/shared', 'GET'),
     sharedDownload: (share_id: string, expires = 300) => request(`/shared/download?share_id=${encodeURIComponent(share_id)}&expires=${expires}`, 'GET'),
     revokeShare: (share_id: string) => request(`/share/revoke?share_id=${encodeURIComponent(share_id)}`, 'DELETE'),
-    accessShare: (token: string, options?: { expires?: number; presign?: boolean; path?: string }) => {
+    logShareDownload: (token: string, options?: { zip?: boolean }, extraHeaders?: Record<string, string>) => {
+      const zipParam = options?.zip ? '&zip=1' : '';
+      return request(`/share/download-log?token=${encodeURIComponent(token)}${zipParam}`, 'POST', undefined, extraHeaders);
+    },
+    accessShare: (token: string, options?: { expires?: number; presign?: boolean; path?: string }, extraHeaders?: Record<string, string>) => {
       const expires = options?.expires ?? 300;
       const presign = options?.presign ?? true;
       const pathParam = options?.path ? `&path=${encodeURIComponent(options.path)}` : '';
-      return request(`/share/access?token=${encodeURIComponent(token)}&expires=${expires}&presign=${presign ? 1 : 0}&format=json${pathParam}`, 'GET');
+      return request(`/share/access?token=${encodeURIComponent(token)}&expires=${expires}&presign=${presign ? 1 : 0}&format=json${pathParam}`, 'GET', undefined, extraHeaders);
     },
     multipart: {
       initiate: (filename: string, totalSize?: number, path?: string) => {
@@ -133,6 +159,62 @@ export function createApi(getToken: () => Promise<string>) {
         form.set('key', key);
         form.set('uploadId', uploadId);
         return request('/multipart/abort', 'POST', form);
+      },
+    },
+
+    chunked: {
+      initiate: (options: {
+        filename: string;
+        file_checksum: string;
+        chunk_size: number;
+        chunk_checksums?: string[];
+        total_size?: number;
+        path?: string;
+      }, requestOptions?: { signal?: AbortSignal }) => {
+        const form = new FormData();
+        form.set('filename', options.filename);
+        form.set('file_checksum', options.file_checksum);
+        form.set('chunk_size', String(options.chunk_size));
+        if (options.chunk_checksums && options.chunk_checksums.length) {
+          form.set('chunk_checksums', JSON.stringify(options.chunk_checksums));
+        }
+        if (typeof options.total_size === 'number') form.set('total_size', String(options.total_size));
+        if (options.path) form.set('path', options.path);
+        return request('/chunked/initiate', 'POST', form, undefined, requestOptions);
+      },
+      uploadChunk: (options: {
+        file_checksum: string;
+        chunk_checksum: string;
+        chunk: Blob;
+      }, requestOptions?: { signal?: AbortSignal }) => {
+        const form = new FormData();
+        form.set('file_checksum', options.file_checksum);
+        form.set('chunk_checksum', options.chunk_checksum);
+        form.set('chunk', options.chunk);
+        return request('/chunked/upload-chunk', 'POST', form, undefined, requestOptions);
+      },
+      complete: (options: {
+        filename: string;
+        file_checksum: string;
+        chunk_checksums: string[];
+        total_size?: number;
+        path?: string;
+      }, requestOptions?: { signal?: AbortSignal }) => {
+        const form = new FormData();
+        form.set('filename', options.filename);
+        form.set('file_checksum', options.file_checksum);
+        form.set('chunk_checksums', JSON.stringify(options.chunk_checksums));
+        if (typeof options.total_size === 'number') form.set('total_size', String(options.total_size));
+        if (options.path) form.set('path', options.path);
+        return request('/chunked/complete', 'POST', form, undefined, requestOptions);
+      },
+
+      unfinished: () => {
+        return request('/chunked/unfinished', 'GET');
+      },
+
+      abort: (file_checksum: string) => {
+        return request(`/chunked/abort?file_checksum=${encodeURIComponent(file_checksum)}`, 'DELETE');
       },
     },
   };

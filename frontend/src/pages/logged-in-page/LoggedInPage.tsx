@@ -14,7 +14,7 @@ export default function LoggedInPage() {
 			  onClick={() =>
 				loginWithRedirect({
 				  authorizationParams: {
-					redirect_uri: window.location.origin,
+					redirect_uri: `${window.location.origin}/callback`,
 					audience: (import.meta as any).env.VITE_AUTH0_AUDIENCE,
 					scope: 'openid profile email offline_access',
 				  },

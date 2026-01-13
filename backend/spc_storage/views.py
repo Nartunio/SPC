@@ -5,17 +5,23 @@ from django.http import JsonResponse, StreamingHttpResponse, HttpResponseRedirec
 from django.views.decorators.http import require_http_methods
 from django.views.decorators.csrf import csrf_exempt
 from config import settings
+from config.validator import Auth0JWTBearerTokenValidator
 from spc_auth.auth import require_auth, token_validator
 from .models import ActivityLog, FileVersion, StorageShare
 from spc_auth.models import UserIdentity
 from django.db import models
 from typing import Optional
 from django.utils import timezone
-from datetime import timedelta
+from datetime import timedelta, datetime
 import os
 import io
 import zipfile
 import json
+import time
+import hashlib
+import re
+import urllib.request
+import urllib.parse
 
 
 FRONTEND_SHARE_BASE = (
@@ -23,6 +29,168 @@ FRONTEND_SHARE_BASE = (
     or getattr(settings, "FRONTEND_ORIGIN", None)
     or ("http://localhost:5173" if getattr(settings, "DEBUG", False) else None)
 )
+
+_AUTH0_MGMT_CACHE = {"token": None, "expires_at": 0.0}
+_ID_TOKEN_VALIDATOR = None
+
+
+def _user_root_prefix(sub: str) -> str:
+    # User storage root lives at: <sub>/root/
+    # All logical paths are relative to this prefix.
+    return f"{sub}/root/"
+
+
+def _user_chunks_prefix(sub: str) -> str:
+    # Chunk staging lives at: <sub>/chunks/
+    # This is intentionally outside <sub>/root/ so it doesn't appear as a user folder.
+    return f"{sub}/chunks/"
+
+
+_HEX_64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+def _is_sha256_hex(value: str) -> bool:
+    if not value:
+        return False
+    return bool(_HEX_64_RE.match(str(value).strip()))
+
+
+def _delete_s3_prefix(s3, bucket: str, prefix: str) -> int:
+    """Delete all objects under a prefix. Returns number of deleted objects (best-effort)."""
+    deleted = 0
+    continuation = None
+    while True:
+        kwargs = {"Bucket": bucket, "Prefix": prefix}
+        if continuation:
+            kwargs["ContinuationToken"] = continuation
+        resp = s3.list_objects_v2(**kwargs)
+        contents = resp.get("Contents", []) or []
+        if not contents:
+            break
+        keys = [{"Key": obj.get("Key")} for obj in contents if obj.get("Key")]
+        # S3 delete_objects allows up to 1000 per request.
+        for i in range(0, len(keys), 1000):
+            batch = keys[i:i + 1000]
+            if not batch:
+                continue
+            s3.delete_objects(Bucket=bucket, Delete={"Objects": batch})
+            deleted += len(batch)
+        if resp.get("IsTruncated"):
+            continuation = resp.get("NextContinuationToken")
+        else:
+            break
+    return deleted
+
+
+def _id_token_validator() -> Optional[Auth0JWTBearerTokenValidator]:
+    global _ID_TOKEN_VALIDATOR
+    if _ID_TOKEN_VALIDATOR is not None:
+        return _ID_TOKEN_VALIDATOR
+    domain = getattr(settings, "AUTH0_DOMAIN", None)
+    client_id = getattr(settings, "AUTH0_CLIENT_ID", None)
+    if not domain or not client_id:
+        _ID_TOKEN_VALIDATOR = None
+        return _ID_TOKEN_VALIDATOR
+    try:
+        _ID_TOKEN_VALIDATOR = Auth0JWTBearerTokenValidator(domain, client_id)
+        return _ID_TOKEN_VALIDATOR
+    except Exception:
+        _ID_TOKEN_VALIDATOR = None
+        return _ID_TOKEN_VALIDATOR
+
+
+def _auth0_domain_url() -> Optional[str]:
+    domain = getattr(settings, "AUTH0_DOMAIN", None)
+    if not domain:
+        return None
+    if domain.startswith("http://") or domain.startswith("https://"):
+        return domain.rstrip("/")
+    return f"https://{domain.rstrip('/')}"
+
+
+def _auth0_management_token() -> Optional[str]:
+    """Fetch an Auth0 Management API token (client credentials)."""
+    now = time.time()
+    if _AUTH0_MGMT_CACHE.get("token") and now < float(_AUTH0_MGMT_CACHE.get("expires_at", 0)) - 60:
+        return _AUTH0_MGMT_CACHE["token"]
+
+    base = _auth0_domain_url()
+    client_id = getattr(settings, "AUTH0_CLIENT_ID", None)
+    client_secret = getattr(settings, "AUTH0_CLIENT_SECRET", None)
+    if not base or not client_id or not client_secret:
+        return None
+
+    payload = json.dumps({
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "audience": f"{base}/api/v2/",
+        "scope": "read:users",
+        "grant_type": "client_credentials",
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        f"{base}/oauth/token",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            token = data.get("access_token")
+            expires_in = int(data.get("expires_in", 0) or 0)
+            if token and expires_in:
+                _AUTH0_MGMT_CACHE["token"] = token
+                _AUTH0_MGMT_CACHE["expires_at"] = now + expires_in
+            return token
+    except Exception:
+        return None
+
+
+def _auth0_user_email_by_sub(user_sub: str) -> Optional[str]:
+    base = _auth0_domain_url()
+    token = _auth0_management_token()
+    if not base or not token or not user_sub:
+        return None
+    user_id = urllib.parse.quote(user_sub, safe="")
+    req = urllib.request.Request(
+        f"{base}/api/v2/users/{user_id}",
+        headers={"Authorization": f"Bearer {token}"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            email = data.get("email")
+            if isinstance(email, str) and email:
+                return email.lower()
+            return None
+    except Exception:
+        return None
+
+
+def _auth0_user_sub_by_email(email: str) -> Optional[str]:
+    """Resolve an Auth0 user_id (sub) from an email via Management API."""
+    base = _auth0_domain_url()
+    token = _auth0_management_token()
+    if not base or not token or not email:
+        return None
+    query = urllib.parse.urlencode({"email": email})
+    req = urllib.request.Request(
+        f"{base}/api/v2/users-by-email?{query}",
+        headers={"Authorization": f"Bearer {token}"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if isinstance(data, list) and data:
+                user_id = data[0].get("user_id")
+                if isinstance(user_id, str) and user_id:
+                    return user_id
+            return None
+    except Exception:
+        return None
 
 
 def _parse_allowed_emails(raw: str):
@@ -154,6 +322,84 @@ def _optional_claims(request):
         return None
 
 
+def _optional_id_token_claims(request):
+    """Validate an Auth0 ID token passed via header.
+
+    Frontend sends this so we can reliably extract email/sub even when the API
+    access token lacks an email claim.
+    """
+    raw = (
+        request.META.get("HTTP_X_AUTH0_ID_TOKEN")
+        or request.headers.get("X-Auth0-Id-Token")
+        or request.headers.get("x-auth0-id-token")
+    )
+    if not raw:
+        return None
+    raw = raw.strip()
+    if raw.lower().startswith("bearer "):
+        raw = raw.split(" ", 1)[1].strip()
+
+    validator = _id_token_validator()
+    if not validator:
+        return None
+    try:
+        token = validator.authenticate_token(raw)
+        return dict(token)
+    except Exception:
+        return None
+
+
+def _optional_frontend_email(request) -> Optional[dict]:
+    """DEV ONLY: accept email from frontend, guarded by matching sub.
+
+    This is a pragmatic fallback when Auth0 access tokens do not include email and
+    ID token isn't available. Only used when DEBUG=True.
+    """
+    if not getattr(settings, "DEBUG", False):
+        return None
+    email = (
+        request.META.get("HTTP_X_AUTH0_USER_EMAIL")
+        or request.headers.get("X-Auth0-User-Email")
+        or request.headers.get("x-auth0-user-email")
+    )
+    sub = (
+        request.META.get("HTTP_X_AUTH0_USER_SUB")
+        or request.headers.get("X-Auth0-User-Sub")
+        or request.headers.get("x-auth0-user-sub")
+    )
+    if not email or not sub:
+        return None
+    email = str(email).strip().lower()
+    sub = str(sub).strip()
+    if not email or "@" not in email:
+        return None
+    if not sub or "|" not in sub:
+        return None
+    return {"email": email, "sub": sub}
+
+
+def _extract_email_from_claims(claims):
+    if not claims:
+        return None
+    email = claims.get("email") or claims.get("emails")
+    if isinstance(email, list):
+        email = email[0] if email else None
+    if isinstance(email, str) and email:
+        return email.lower()
+    # Look for any namespaced email claim
+    for key, value in claims.items():
+        if not isinstance(key, str):
+            continue
+        if "email" in key.lower():
+            if isinstance(value, list):
+                candidate = value[0] if value else None
+            else:
+                candidate = value
+            if isinstance(candidate, str) and candidate:
+                return candidate.lower()
+    return None
+
+
 def _record_identity(claims):
     if not claims:
         return
@@ -180,7 +426,7 @@ def get_files(request):
         return JsonResponse({"error": "s3_not_configured"}, status=500)
 
     claims = dict(token)
-    user_prefix = f"{claims['sub']}/"
+    user_prefix = _user_root_prefix(claims['sub'])
     logical_path = _sanitize_subpath(request.GET.get("path", "")).rstrip("/")
     current_prefix = f"{user_prefix}{logical_path}/" if logical_path else user_prefix
 
@@ -208,6 +454,19 @@ def get_files(request):
     except ClientError as e:
         return JsonResponse({"error": "s3_error", "details": str(e)}, status=502)
 
+    # Best-effort actor email resolution (used as a fallback for created_by_email).
+    _record_identity(claims)
+    actor_email = (_extract_email_from_claims(claims) or "").strip().lower()
+    if not actor_email:
+        try:
+            ident = UserIdentity.objects.filter(sub=claims['sub']).first()
+            if ident and ident.email:
+                actor_email = str(ident.email).strip().lower()
+        except Exception:
+            pass
+    if not actor_email:
+        actor_email = "anonymous"
+
     directories = []
     for p in resp.get("CommonPrefixes", []):
         prefix = p.get("Prefix", "")
@@ -218,7 +477,61 @@ def get_files(request):
                 "is_empty": _is_prefix_empty(s3, bucket, prefix),
             })
 
+    # Best-effort folder metadata (based on ActivityLog timestamps for keys under the folder prefix).
+    for d in directories:
+        folder_prefix = f"{current_prefix}{d.get('name', '')}/"
+        created_at = None
+        last_modified = None
+        created_by_email = None
+        try:
+            earliest = (
+                ActivityLog.objects.filter(
+                    user_sub=claims['sub'],
+                    success=True,
+                    key__startswith=folder_prefix,
+                )
+                .exclude(action="list")
+                .only("created_at", "extra")
+                .order_by("created_at")
+                .first()
+            )
+            latest = (
+                ActivityLog.objects.filter(
+                    user_sub=claims['sub'],
+                    success=True,
+                    key__startswith=folder_prefix,
+                )
+                .exclude(action="list")
+                .only("created_at")
+                .order_by("-created_at")
+                .first()
+            )
+            if earliest:
+                extra = (earliest.extra or {}) if hasattr(earliest, "extra") else {}
+                origin = extra.get("origin_created_at")
+                created_by_email = extra.get("origin_created_by_email") or extra.get("uploader_email")
+                if isinstance(origin, str) and origin:
+                    try:
+                        created_at = datetime.fromisoformat(origin.replace("Z", "+00:00"))
+                        if timezone.is_naive(created_at):
+                            created_at = timezone.make_aware(created_at, timezone.get_current_timezone())
+                    except Exception:
+                        created_at = earliest.created_at
+                else:
+                    created_at = earliest.created_at
+            if latest:
+                last_modified = latest.created_at
+        except Exception:
+            created_at = None
+            last_modified = None
+            created_by_email = None
+
+        d["created_at"] = created_at.isoformat() if created_at else None
+        d["last_modified"] = last_modified.isoformat() if last_modified else None
+        d["created_by_email"] = (str(created_by_email).strip().lower() if created_at and isinstance(created_by_email, str) and created_by_email else actor_email) if created_at else None
+
     files = []
+    file_keys: list[str] = []
     for obj in resp.get("Contents", []):
         key = obj.get("Key", "")
         if key.endswith("/"):
@@ -226,12 +539,91 @@ def get_files(request):
         name = key[len(current_prefix):]
         if "/" in name:
             continue
+        file_keys.append(key)
         files.append({
             "name": name,
             "size": obj.get("Size"),
             "last_modified": obj.get("LastModified").isoformat() if obj.get("LastModified") else None,
             "etag": obj.get("ETag"),
         })
+
+    # Best-effort creation time + creator: first successful upload log for the exact key.
+    # For chunked uploads we log on finalize as action="upload_chunked", so include it.
+    created_at_by_key: dict[str, datetime] = {}
+    created_by_email_by_key: dict[str, str] = {}
+    if file_keys:
+        try:
+            created_qs = (
+                ActivityLog.objects.filter(
+                    user_sub=claims['sub'],
+                    action__in=["upload", "upload_chunked"],
+                    success=True,
+                    key__in=file_keys,
+                )
+                .only("key", "created_at", "extra")
+                .order_by("created_at")
+            )
+            for l in created_qs:
+                if l.key and l.key not in created_at_by_key:
+                    created_at_by_key[str(l.key)] = l.created_at
+                    extra = (l.extra or {}) if hasattr(l, "extra") else {}
+                    uploader = extra.get("uploader_email")
+                    if isinstance(uploader, str) and uploader.strip():
+                        created_by_email_by_key[str(l.key)] = uploader.strip().lower()
+        except Exception:
+            created_at_by_key = {}
+            created_by_email_by_key = {}
+
+    # If files were renamed/moved, fall back to origin_created_at from move logs keyed by the *current* key.
+    origin_created_at_by_key: dict[str, str] = {}
+    origin_created_by_email_by_key: dict[str, str] = {}
+    missing_file_keys = [k for k in file_keys if k not in created_at_by_key]
+    if missing_file_keys:
+        try:
+            move_qs = (
+                ActivityLog.objects.filter(
+                    user_sub=claims['sub'],
+                    action="move",
+                    success=True,
+                    key__in=missing_file_keys,
+                )
+                .only("key", "created_at", "extra")
+                .order_by("-created_at")
+            )
+            for l in move_qs:
+                if not l.key:
+                    continue
+                if str(l.key) in origin_created_at_by_key:
+                    continue
+                extra = l.extra or {}
+                oc = extra.get("origin_created_at")
+                if isinstance(oc, str) and oc:
+                    origin_created_at_by_key[str(l.key)] = oc
+                ob = extra.get("origin_created_by_email")
+                if isinstance(ob, str) and ob:
+                    origin_created_by_email_by_key[str(l.key)] = ob.strip().lower()
+        except Exception:
+            origin_created_at_by_key = {}
+            origin_created_by_email_by_key = {}
+
+    # Attach metadata per returned file.
+    if created_at_by_key:
+        for f in files:
+            full_key = f"{current_prefix}{f.get('name', '')}"
+            dt = created_at_by_key.get(full_key)
+            if dt:
+                f["created_at"] = dt.isoformat()
+                f["created_by_email"] = created_by_email_by_key.get(full_key) or actor_email
+            else:
+                origin = origin_created_at_by_key.get(full_key)
+                f["created_at"] = origin or None
+                f["created_by_email"] = origin_created_by_email_by_key.get(full_key) if origin else None
+    else:
+        for f in files:
+            full_key = f"{current_prefix}{f.get('name', '')}"
+            origin = origin_created_at_by_key.get(full_key)
+            f["created_at"] = origin or None
+            f["created_by_email"] = origin_created_by_email_by_key.get(full_key) if origin else None
 
     return JsonResponse({
         "prefix": current_prefix,
@@ -254,7 +646,7 @@ def _sanitize_subpath(value: str) -> str:
 def _user_prefix_from_request(request) -> str:
     token = getattr(request, "oauth_token", None)
     claims = dict(token)
-    return f"{claims['sub']}/"
+    return _user_root_prefix(claims['sub'])
 
 
 @require_auth(None)
@@ -353,12 +745,22 @@ def upload_file(request):
 
         extra = {"ContentType": getattr(file_obj, "content_type", None) or "application/octet-stream"}
         s3.upload_fileobj(file_obj, bucket, key, ExtraArgs=extra)
+
+        uploader_email = (_extract_email_from_claims(claims) or "").strip().lower()
+        if not uploader_email:
+            try:
+                ident = UserIdentity.objects.filter(sub=claims.get('sub')).first()
+                if ident and ident.email:
+                    uploader_email = str(ident.email).strip().lower()
+            except Exception:
+                uploader_email = ""
+
         ActivityLog.objects.create(
             user_sub=claims['sub'],
             action="upload",
             key=key,
             success=True,
-            extra={"size": getattr(file_obj, "size", None)},
+            extra={"size": getattr(file_obj, "size", None), "uploader_email": uploader_email or None},
         )
         return JsonResponse({"uploaded": True, "key": key})
     except ClientError as e:
@@ -419,12 +821,75 @@ def move_item(request):
         dest_prefix = user_prefix
     
     # Extract the item name from source
-    item_name = item_name_override or source_subkey.rstrip("/").split("/")[-1]
+    old_name = source_subkey.rstrip("/").split("/")[-1]
+    item_name = item_name_override or old_name
     destination = f"{dest_prefix}{item_name}{'/' if is_directory else ''}"
+
+    # Relative (logical) paths for logging/UI (no user_prefix leakage)
+    destination_rel = destination[len(user_prefix):] if destination.startswith(user_prefix) else destination
+    if not is_directory:
+        source_rel = source_subkey.rstrip("/")
+        destination_rel = destination_rel.rstrip("/")
+    else:
+        source_rel = source_subkey if source_subkey.endswith("/") else f"{source_subkey.rstrip('/')}/"
+        destination_rel = destination_rel if destination_rel.endswith("/") else f"{destination_rel.rstrip('/')}/"
+
+    is_rename = bool(item_name_override) and old_name != item_name
     
     # Avoid moving to same location
     if source == destination:
         return JsonResponse({"error": "same_source_destination"}, status=400)
+
+    # Best-effort: preserve original creation timestamp across moves/renames.
+    origin_created_at: Optional[str] = None
+    origin_created_by_email: Optional[str] = None
+    try:
+        if is_directory:
+            # Earliest successful non-list activity under the source prefix.
+            earliest = (
+                ActivityLog.objects.filter(
+                    user_sub=claims['sub'],
+                    success=True,
+                    key__startswith=source,
+                )
+                .exclude(action="list")
+                .only("created_at", "extra")
+                .order_by("created_at")
+                .first()
+            )
+            if earliest and earliest.created_at:
+                origin_created_at = earliest.created_at.isoformat()
+                try:
+                    extra = (earliest.extra or {}) if hasattr(earliest, "extra") else {}
+                    ocb = extra.get("origin_created_by_email") or extra.get("uploader_email")
+                    if isinstance(ocb, str) and ocb.strip():
+                        origin_created_by_email = ocb.strip().lower()
+                except Exception:
+                    origin_created_by_email = None
+        else:
+            earliest = (
+                ActivityLog.objects.filter(
+                    user_sub=claims['sub'],
+                    success=True,
+                    action__in=["upload", "upload_chunked"],
+                    key=source,
+                )
+                .only("created_at", "extra")
+                .order_by("created_at")
+                .first()
+            )
+            if earliest and earliest.created_at:
+                origin_created_at = earliest.created_at.isoformat()
+                try:
+                    extra = (earliest.extra or {}) if hasattr(earliest, "extra") else {}
+                    ocb = extra.get("uploader_email")
+                    if isinstance(ocb, str) and ocb.strip():
+                        origin_created_by_email = ocb.strip().lower()
+                except Exception:
+                    origin_created_by_email = None
+    except Exception:
+        origin_created_at = None
+        origin_created_by_email = None
 
     try:
         if is_directory:
@@ -517,8 +982,57 @@ def move_item(request):
                 action="move_prefix",
                 key=source,
                 success=True,
-                extra={"destination": destination, "moved": moved_count}
+                extra={
+                    "destination": destination_rel,
+                    "from": source_rel,
+                    "to": destination_rel,
+                    "moved": moved_count,
+                    "origin_created_at": origin_created_at,
+                    "origin_created_by_email": origin_created_by_email,
+                    "old_name": old_name,
+                    "new_name": item_name,
+                    "rename": is_rename,
+                }
             )
+
+            # Also log the destination so folder metadata works after rename/move.
+            try:
+                ActivityLog.objects.create(
+                    user_sub=claims['sub'],
+                    action="move_prefix",
+                    key=destination,
+                    success=True,
+                    extra={
+                        "source": source_rel,
+                        "from": source_rel,
+                        "to": destination_rel,
+                        "moved": moved_count,
+                        "origin_created_at": origin_created_at,
+                        "origin_created_by_email": origin_created_by_email,
+                        "old_name": old_name,
+                        "new_name": item_name,
+                        "rename": is_rename,
+                    },
+                )
+            except Exception:
+                pass
+
+            # Keep shares in sync (only when the move fully succeeded)
+            try:
+                src_rel = source_subkey
+                dst_rel = destination[len(user_prefix):]
+                if not src_rel.endswith("/"):
+                    src_rel = f"{src_rel.rstrip('/')}/"
+                if not dst_rel.endswith("/"):
+                    dst_rel = f"{dst_rel.rstrip('/')}/"
+                shares = list(StorageShare.objects.filter(owner_sub=claims['sub'], key__startswith=src_rel))
+                for sh in shares:
+                    sh.key = f"{dst_rel}{sh.key[len(src_rel):]}"
+                    sh.is_directory = sh.key.endswith("/")
+                    sh.save(update_fields=["key", "is_directory"])
+            except Exception:
+                # Shares are best-effort; do not fail the move for share update issues.
+                pass
 
             try:
                 s3.delete_object(Bucket=bucket, Key=source)
@@ -534,13 +1048,54 @@ def move_item(request):
                 Key=destination
             )
             s3.delete_object(Bucket=bucket, Key=source)
+
+            # Keep shares in sync for this exact key
+            try:
+                src_rel = source_subkey.rstrip("/")
+                dst_rel = destination[len(user_prefix):].rstrip("/")
+                StorageShare.objects.filter(owner_sub=claims['sub'], key=src_rel).update(
+                    key=dst_rel,
+                    is_directory=False,
+                )
+            except Exception:
+                pass
             ActivityLog.objects.create(
                 user_sub=claims['sub'],
                 action="move",
                 key=source,
                 success=True,
-                extra={"destination": destination}
+                extra={
+                    "destination": destination_rel,
+                    "from": source_rel,
+                    "to": destination_rel,
+                    "origin_created_at": origin_created_at,
+                    "origin_created_by_email": origin_created_by_email,
+                    "old_name": old_name,
+                    "new_name": item_name,
+                    "rename": is_rename,
+                }
             )
+
+            # Also log the destination so file metadata works after rename/move.
+            try:
+                ActivityLog.objects.create(
+                    user_sub=claims['sub'],
+                    action="move",
+                    key=destination,
+                    success=True,
+                    extra={
+                        "source": source_rel,
+                        "from": source_rel,
+                        "to": destination_rel,
+                        "origin_created_at": origin_created_at,
+                        "origin_created_by_email": origin_created_by_email,
+                        "old_name": old_name,
+                        "new_name": item_name,
+                        "rename": is_rename,
+                    },
+                )
+            except Exception:
+                pass
             return JsonResponse({"moved": True, "source": source, "destination": destination})
     except ClientError as e:
         ActivityLog.objects.create(
@@ -714,7 +1269,7 @@ def restore_version(request):
     if not fv:
         return JsonResponse({"error": "version_not_found"}, status=404)
 
-    user_prefix = f"{claims['sub']}/"
+    user_prefix = _user_root_prefix(claims['sub'])
     current_key = f"{user_prefix}{logical}"
     try:
         s3.copy_object(Bucket=bucket, CopySource={"Bucket": bucket, "Key": fv.object_key}, Key=current_key)
@@ -730,10 +1285,92 @@ def restore_version(request):
 def list_logs(request):
     token = getattr(request, "oauth_token", None)
     claims = dict(token)
-    limit = int(request.GET.get("limit", 50))
-    logs = ActivityLog.objects.filter(user_sub=claims['sub']).order_by("-created_at")[: max(1, min(200, limit))]
+    try:
+        limit = int(request.GET.get("limit", 50))
+    except Exception:
+        limit = 50
+    try:
+        offset = int(request.GET.get("offset", 0))
+    except Exception:
+        offset = 0
+
+    limit = max(1, min(200, limit))
+    offset = max(0, offset)
+
+    action = (request.GET.get("action") or "").strip()
+
+    raw_from = (request.GET.get("from") or request.GET.get("start") or "").strip()
+    raw_to = (request.GET.get("to") or request.GET.get("end") or "").strip()
+
+    def _parse_dt(raw: str, *, end_of_day: bool) -> Optional[datetime]:
+        if not raw:
+            return None
+        try:
+            # Allow ISO datetimes. Also accept 'Z'.
+            normalized = raw.replace("Z", "+00:00")
+            if len(normalized) == 10 and normalized[4] == "-" and normalized[7] == "-":
+                d = datetime.fromisoformat(normalized).date()
+                if end_of_day:
+                    dt = datetime(d.year, d.month, d.day, 23, 59, 59, 999999)
+                else:
+                    dt = datetime(d.year, d.month, d.day, 0, 0, 0)
+            else:
+                dt = datetime.fromisoformat(normalized)
+            if timezone.is_naive(dt):
+                return timezone.make_aware(dt, timezone.get_current_timezone())
+            return dt
+        except Exception:
+            return None
+
+    from_dt = _parse_dt(raw_from, end_of_day=False)
+    to_dt = _parse_dt(raw_to, end_of_day=True)
+
+    qs = ActivityLog.objects.filter(user_sub=claims['sub'])
+    if action:
+        qs = qs.filter(action=action)
+    if from_dt:
+        qs = qs.filter(created_at__gte=from_dt)
+    if to_dt:
+        qs = qs.filter(created_at__lte=to_dt)
+
+    user_prefix = _user_root_prefix(claims['sub'])
+
+    # Best-effort actor email resolution.
+    _record_identity(claims)
+    actor_email = (_extract_email_from_claims(claims) or "").strip().lower()
+    if not actor_email:
+        try:
+            ident = UserIdentity.objects.filter(sub=claims['sub']).first()
+            if ident and ident.email:
+                actor_email = str(ident.email).strip().lower()
+        except Exception:
+            pass
+    if not actor_email:
+        actor_email = "anonymous"
+
+    def _mask_key(key: Optional[str]) -> Optional[str]:
+        if not key:
+            return key
+        try:
+            if key.startswith(user_prefix):
+                rest = key[len(user_prefix):]
+                # Display paths rooted at the user's storage root.
+                # '/' represents the user's root folder; nested paths are '/<path>'.
+                return f"/{rest}" if rest else "/"
+        except Exception:
+            pass
+        return key
+
+    logs = qs.order_by("-created_at")[offset : offset + limit]
     data = [
-        {"action": l.action, "key": l.key, "success": l.success, "created_at": l.created_at.isoformat(), "extra": l.extra}
+        {
+            "action": l.action,
+            "key": _mask_key(l.key),
+            "success": l.success,
+            "created_at": l.created_at.isoformat(),
+            "extra": l.extra,
+            "email": actor_email,
+        }
         for l in logs
     ]
     return JsonResponse({"logs": data})
@@ -822,6 +1459,21 @@ def share_with_user(request):
     if not target_email:
         return JsonResponse({"error": "target_email_required"}, status=400)
 
+    # Best-effort: resolve a stable target_sub for private shares so recipients can
+    # list their shares even when email claims are missing.
+    target_sub_resolved: Optional[str] = None
+    if target_sub:
+        target_sub_resolved = target_sub
+    else:
+        try:
+            identity = UserIdentity.objects.filter(email=target_email).first()
+            if identity:
+                target_sub_resolved = identity.sub
+        except Exception:
+            pass
+        if not target_sub_resolved:
+            target_sub_resolved = _auth0_user_sub_by_email(target_email)
+
     bucket = settings.S3_BUCKET
     if not bucket:
         return JsonResponse({"error": "s3_not_configured"}, status=500)
@@ -830,7 +1482,7 @@ def share_with_user(request):
     except Exception as e:
         return JsonResponse({"error": "s3_client_error", "details": str(e)}, status=500)
 
-    owner_prefix = f"{claims['sub']}/"
+    owner_prefix = _user_root_prefix(claims['sub'])
     full_key = f"{owner_prefix}{key}"
     if key.endswith("/"):
         if not _prefix_exists(s3, bucket, full_key):
@@ -848,7 +1500,7 @@ def share_with_user(request):
         key=key,
         permission=permission,
         visibility="private",
-        target_sub=None,
+        target_sub=target_sub_resolved,
         target_email=target_email,
         allowed_emails=[],
         expires_in=expires_in,
@@ -856,7 +1508,13 @@ def share_with_user(request):
     if error:
         return error
 
-    ActivityLog.objects.create(user_sub=claims['sub'], action="share_create", key=key, success=True, extra={"target_sub": target_sub, "visibility": "private"})
+    ActivityLog.objects.create(
+        user_sub=claims['sub'],
+        action="share_create",
+        key=key,
+        success=True,
+        extra={"target_sub": target_sub_resolved or target_sub, "visibility": "private"},
+    )
     return JsonResponse(_build_share_payload(share))
 
 
@@ -882,6 +1540,7 @@ def create_share(request):
 
     parsed_emails = _parse_allowed_emails(allowed_emails_raw)
     target_email = target_email_raw.strip().lower()
+    target_sub_resolved: Optional[str] = None
     if visibility == "private":
         if not target_email and target_sub:
             identity = UserIdentity.objects.filter(sub=target_sub).first()
@@ -889,6 +1548,17 @@ def create_share(request):
                 target_email = identity.email
         if not target_email:
             return JsonResponse({"error": "target_email_required"}, status=400)
+        # Try to resolve a stable target_sub for private shares.
+        # This is important because Auth0 access tokens often omit email claims.
+        if target_sub:
+            target_sub_resolved = target_sub
+        else:
+            identity = UserIdentity.objects.filter(email=target_email).first()
+            if identity:
+                target_sub_resolved = identity.sub
+            if not target_sub_resolved:
+                # Fallback for when the recipient has never hit our API (no UserIdentity record)
+                target_sub_resolved = _auth0_user_sub_by_email(target_email)
     if visibility == "protected" and not parsed_emails:
         return JsonResponse({"error": "allowed_emails_required"}, status=400)
 
@@ -898,7 +1568,7 @@ def create_share(request):
     except Exception as e:
         return JsonResponse({"error": "s3_client_error", "details": str(e)}, status=500)
 
-    owner_prefix = f"{claims['sub']}/"
+    owner_prefix = _user_root_prefix(claims['sub'])
     full_key = f"{owner_prefix}{key}"
     if key.endswith("/"):
         if not _prefix_exists(s3, bucket, full_key):
@@ -911,16 +1581,45 @@ def create_share(request):
         if not _key_exists(s3, bucket, full_key):
             return JsonResponse({"error": "not_found"}, status=404)
 
-    share, error = _create_share(
-        owner_sub=claims['sub'],
-        key=key,
-        permission=permission,
-        visibility=visibility,
-        target_sub=None,
-        target_email=target_email,
-        allowed_emails=parsed_emails,
-        expires_in=expires_in,
-    )
+    existing = StorageShare.objects.filter(owner_sub=claims['sub'], key=key).first()
+    if existing:
+        # Update in place to avoid issuing a new token/link
+        existing.visibility = visibility
+        existing.permission = permission
+        if visibility == "private":
+            # Only overwrite target_sub if we can resolve one; otherwise keep the old value
+            # so existing links keep working even if email claims are missing.
+            if target_sub_resolved:
+                existing.target_sub = target_sub_resolved
+        else:
+            existing.target_sub = None
+        existing.target_email = target_email or None
+        existing.allowed_emails = parsed_emails
+        if expires_in:
+            try:
+                seconds = int(expires_in)
+                existing.expires_at = timezone.now() + timedelta(seconds=seconds)
+            except Exception:
+                existing.expires_at = None
+        else:
+            existing.expires_at = None
+        existing.is_directory = key.endswith("/")
+        existing.save()
+        share = existing
+        created = False
+        error = None
+    else:
+        share, error = _create_share(
+            owner_sub=claims['sub'],
+            key=key,
+            permission=permission,
+            visibility=visibility,
+            target_sub=target_sub_resolved,
+            target_email=target_email,
+            allowed_emails=parsed_emails,
+            expires_in=expires_in,
+        )
+        created = True
     if error:
         return error
 
@@ -928,7 +1627,7 @@ def create_share(request):
     payload["access_url"] = request.build_absolute_uri(f"/storage/share/access?token={share.token}")
     ActivityLog.objects.create(
         user_sub=claims['sub'],
-        action="share_create",
+        action="share_create" if created else "share_update",
         key=key,
         success=True,
         extra={"visibility": visibility, "target_sub": target_sub, "allowed_emails": parsed_emails},
@@ -952,28 +1651,109 @@ def access_share(request):
     if not share:
         return JsonResponse({"error": "not_found"}, status=404)
 
-    if share.visibility == "private":
-        return JsonResponse({"error": "private_share_use_authenticated_flow"}, status=403)
-
     if share.expires_at and share.expires_at <= timezone.now():
-        return JsonResponse({"error": "share_expired"}, status=403)
+        # Do not reveal whether a share once existed.
+        return JsonResponse({"error": "not_found"}, status=404)
 
     claims = _optional_claims(request)
+    viewer_sub = (claims or {}).get("sub")
+    id_claims = _optional_id_token_claims(request)
+    id_sub = (id_claims or {}).get("sub")
+    # Only trust ID token claims if they belong to the same subject as the API access token.
+    if id_claims and viewer_sub and id_sub and viewer_sub != id_sub:
+        id_claims = None
+
     _record_identity(claims)
-    viewer_email = (claims or {}).get("email") or (claims or {}).get("emails")
-    if isinstance(viewer_email, list):
-        viewer_email = viewer_email[0] if viewer_email else None
-    if isinstance(viewer_email, str):
-        viewer_email = viewer_email.lower()
+    if id_claims:
+        _record_identity(id_claims)
+
+    fe_claims = _optional_frontend_email(request)
+    if fe_claims and viewer_sub and fe_claims.get("sub") != viewer_sub:
+        fe_claims = None
+    if fe_claims:
+        _record_identity(fe_claims)
+
+    viewer_email = (
+        _extract_email_from_claims(claims)
+        or _extract_email_from_claims(id_claims)
+        or _extract_email_from_claims(fe_claims)
+    )
+    if not viewer_email and viewer_sub:
+        identity = UserIdentity.objects.filter(sub=viewer_sub).first()
+        if identity and identity.email:
+            viewer_email = identity.email.lower()
+    if not viewer_email and viewer_sub:
+        viewer_email = _auth0_user_email_by_sub(viewer_sub) or viewer_email
+
+    if share.visibility == "private":
+        if not claims:
+            return JsonResponse({"error": "auth_required"}, status=401)
+        # Try to backfill target_sub so we can validate via viewer_sub.
+        if not share.target_sub and share.target_email:
+            resolved = None
+            ident = UserIdentity.objects.filter(email=str(share.target_email).lower()).first()
+            if ident and ident.sub:
+                resolved = ident.sub
+            if not resolved:
+                resolved = _auth0_user_sub_by_email(str(share.target_email).lower())
+            if resolved:
+                try:
+                    share.target_sub = resolved
+                    share.save(update_fields=["target_sub"])
+                except Exception:
+                    pass
+
+        target_email = (share.target_email or "").lower()
+        target_sub = share.target_sub
+        allowed_emails = [e.lower() for e in (share.allowed_emails or [])]
+        allowed = False
+        if target_email and viewer_email:
+            allowed = viewer_email == target_email
+        if not allowed and target_sub and viewer_sub:
+            allowed = viewer_sub == target_sub
+        if not allowed and viewer_email and viewer_email in allowed_emails:
+            allowed = True
+        if not allowed:
+            try:
+                ActivityLog.objects.create(
+                    user_sub=share.owner_sub,
+                    action="share_access_denied",
+                    key=share.key,
+                    success=False,
+                    extra={"reason": "access_denied"},
+                )
+            except Exception:
+                pass
+            return JsonResponse({"error": "access_denied"}, status=403)
 
     if share.visibility == "protected":
         if not claims:
-            return JsonResponse({"error": "auth_required", "visibility": share.visibility, "is_directory": share.is_directory, "requires_auth": True}, status=401)
+            return JsonResponse({"error": "auth_required"}, status=401)
         if not viewer_email:
-            return JsonResponse({"error": "email_required", "visibility": share.visibility, "is_directory": share.is_directory, "requires_auth": True}, status=403)
+            try:
+                ActivityLog.objects.create(
+                    user_sub=share.owner_sub,
+                    action="share_access_denied",
+                    key=share.key,
+                    success=False,
+                    extra={"reason": "access_denied"},
+                )
+            except Exception:
+                pass
+            return JsonResponse({"error": "access_denied"}, status=403)
         allowed = [e.lower() for e in (share.allowed_emails or [])]
         if viewer_email.lower() not in allowed:
-            return JsonResponse({"error": "email_not_allowed", "visibility": share.visibility, "is_directory": share.is_directory, "requires_auth": False}, status=403)
+            try:
+                ActivityLog.objects.create(
+                    user_sub=share.owner_sub,
+                    action="share_access_denied",
+                    key=share.key,
+                    success=False,
+                    extra={"reason": "access_denied"},
+                )
+            except Exception:
+                pass
+            return JsonResponse({"error": "access_denied"}, status=403)
 
     bucket = settings.S3_BUCKET
     if not bucket:
@@ -984,7 +1764,7 @@ def access_share(request):
     except Exception as e:
         return JsonResponse({"error": "s3_client_error", "details": str(e)}, status=500)
 
-    full_key = f"{share.owner_sub}/{share.key}"
+    full_key = f"{_user_root_prefix(share.owner_sub)}{share.key}"
 
     payload = {
         "key": share.key,
@@ -1002,10 +1782,10 @@ def access_share(request):
             zip_bytes = _zip_prefix_to_bytes(s3, bucket, full_key)
             ActivityLog.objects.create(
                 user_sub=share.owner_sub,
-                action="share_access_zip",
+                action="share_download",
                 key=share.key,
                 success=True,
-                extra={"visibility": share.visibility, "viewer_email": viewer_email},
+                extra={"kind": "zip"},
             )
             response = HttpResponse(zip_bytes, content_type='application/zip')
             response['Content-Disposition'] = f'attachment; filename="{folder_name}.zip"'
@@ -1056,6 +1836,16 @@ def access_share(request):
             "files": files,
             "zip_url": request.build_absolute_uri(f"/storage/share/access?token={token_param}&zip=1&format=json") if (directories or files) else None,
         })
+        try:
+            ActivityLog.objects.create(
+                user_sub=share.owner_sub,
+                action="share_access_success",
+                key=share.key,
+                success=True,
+                extra={"kind": "directory", "path": rel_path or ""},
+            )
+        except Exception:
+            pass
         return JsonResponse(payload)
 
     if not _key_exists(s3, bucket, full_key):
@@ -1076,17 +1866,194 @@ def access_share(request):
                 },
                 ExpiresIn=int(request.GET.get("expires", 300)),
             )
-        ActivityLog.objects.create(
-            user_sub=share.owner_sub,
-            action="share_access",
-            key=share.key,
-            success=True,
-            extra={"visibility": share.visibility, "viewer_email": viewer_email},
-        )
+        try:
+            ActivityLog.objects.create(
+                user_sub=share.owner_sub,
+                action="share_access_success",
+                key=share.key,
+                success=True,
+                extra={"kind": "file"},
+            )
+        except Exception:
+            pass
         payload.update({"url": url} if url else {})
         return JsonResponse(payload)
     except ClientError as e:
         return JsonResponse({"error": "s3_error", "details": str(e)}, status=502)
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def log_share_download(request):
+    """Log a download attempt for a share link.
+
+    The actual bytes are downloaded from S3 via a presigned URL, so the backend
+    cannot observe the real download. This logs the user's intent (button click)
+    after applying the same share authorization rules.
+    """
+    token_param = request.GET.get("token")
+    if not token_param:
+        return JsonResponse({"error": "missing_token"}, status=400)
+
+    share = StorageShare.objects.filter(token=token_param).first()
+    if not share:
+        return JsonResponse({"error": "not_found"}, status=404)
+
+    if share.expires_at and share.expires_at <= timezone.now():
+        return JsonResponse({"error": "not_found"}, status=404)
+
+    # Reuse the same identity extraction used in access_share
+    claims = _optional_claims(request)
+    viewer_sub = (claims or {}).get("sub")
+    id_claims = _optional_id_token_claims(request)
+    id_sub = (id_claims or {}).get("sub")
+    if id_claims and viewer_sub and id_sub and viewer_sub != id_sub:
+        id_claims = None
+    _record_identity(claims)
+    if id_claims:
+        _record_identity(id_claims)
+    fe_claims = _optional_frontend_email(request)
+    if fe_claims and viewer_sub and fe_claims.get("sub") != viewer_sub:
+        fe_claims = None
+    if fe_claims:
+        _record_identity(fe_claims)
+
+    viewer_email = (
+        _extract_email_from_claims(claims)
+        or _extract_email_from_claims(id_claims)
+        or _extract_email_from_claims(fe_claims)
+    )
+    if not viewer_email and viewer_sub:
+        identity = UserIdentity.objects.filter(sub=viewer_sub).first()
+        if identity and identity.email:
+            viewer_email = identity.email.lower()
+    if not viewer_email and viewer_sub:
+        viewer_email = _auth0_user_email_by_sub(viewer_sub) or viewer_email
+
+    # Authorization (non-informative errors)
+    if share.visibility in ("private", "protected") and not claims:
+        try:
+            ActivityLog.objects.create(
+                user_sub=share.owner_sub,
+                action="share_download_denied",
+                key=share.key,
+                success=False,
+                extra={"reason": "auth_required"},
+            )
+        except Exception:
+            pass
+        return JsonResponse({"error": "auth_required"}, status=401)
+
+    if share.visibility == "private":
+        if not share.target_sub and share.target_email:
+            resolved = None
+            ident = UserIdentity.objects.filter(email=str(share.target_email).lower()).first()
+            if ident and ident.sub:
+                resolved = ident.sub
+            if not resolved:
+                resolved = _auth0_user_sub_by_email(str(share.target_email).lower())
+            if resolved:
+                try:
+                    share.target_sub = resolved
+                    share.save(update_fields=["target_sub"])
+                except Exception:
+                    pass
+
+        target_email = (share.target_email or "").lower()
+        target_sub = share.target_sub
+        allowed_emails = [e.lower() for e in (share.allowed_emails or [])]
+        allowed = False
+        if target_email and viewer_email:
+            allowed = viewer_email == target_email
+        if not allowed and target_sub and viewer_sub:
+            allowed = viewer_sub == target_sub
+        if not allowed and viewer_email and viewer_email in allowed_emails:
+            allowed = True
+        if not allowed:
+            try:
+                ActivityLog.objects.create(
+                    user_sub=share.owner_sub,
+                    action="share_download_denied",
+                    key=share.key,
+                    success=False,
+                    extra={"reason": "access_denied"},
+                )
+            except Exception:
+                pass
+            return JsonResponse({"error": "access_denied"}, status=403)
+
+    if share.visibility == "protected":
+        if not viewer_email:
+            try:
+                ActivityLog.objects.create(
+                    user_sub=share.owner_sub,
+                    action="share_download_denied",
+                    key=share.key,
+                    success=False,
+                    extra={"reason": "access_denied"},
+                )
+            except Exception:
+                pass
+            return JsonResponse({"error": "access_denied"}, status=403)
+        allowed = [e.lower() for e in (share.allowed_emails or [])]
+        if viewer_email.lower() not in allowed:
+            try:
+                ActivityLog.objects.create(
+                    user_sub=share.owner_sub,
+                    action="share_download_denied",
+                    key=share.key,
+                    success=False,
+                    extra={"reason": "access_denied"},
+                )
+            except Exception:
+                pass
+            return JsonResponse({"error": "access_denied"}, status=403)
+
+    kind = "zip" if request.GET.get("zip") == "1" else "file"
+    try:
+        ActivityLog.objects.create(
+            user_sub=share.owner_sub,
+            action="share_download",
+            key=share.key,
+            success=True,
+            extra={"kind": kind},
+        )
+    except Exception:
+        pass
+
+    return HttpResponse(status=204)
+
+
+@require_auth(None)
+@require_http_methods(["GET"])
+def list_owned_shares(request):
+    token = getattr(request, "oauth_token", None)
+    claims = dict(token)
+    _record_identity(claims)
+
+    prefix = _sanitize_subpath(request.GET.get("prefix", "")).rstrip("/")
+    qs = StorageShare.objects.filter(owner_sub=claims['sub'])
+    if prefix:
+        qs = qs.filter(key__startswith=f"{prefix}/" if not prefix.endswith("/") else prefix)
+
+    now = timezone.now()
+    shares = qs.filter(models.Q(expires_at__isnull=True) | models.Q(expires_at__gt=now))
+    data = []
+    for s in shares:
+        access_url = request.build_absolute_uri(f"/storage/share/access?token={s.token}")
+        data.append({
+            "share_id": str(s.id),
+            "token": s.token,
+            "key": s.key,
+            "is_directory": s.is_directory,
+            "visibility": s.visibility,
+            "permission": s.permission,
+            "target_email": s.target_email,
+            "allowed_emails": s.allowed_emails,
+            "expires_at": s.expires_at.isoformat() if s.expires_at else None,
+            "access_url": access_url,
+        })
+    return JsonResponse({"shares": data})
 
 
 @require_auth(None)
@@ -1095,17 +2062,96 @@ def list_shared_with_me(request):
     token = getattr(request, "oauth_token", None)
     claims = dict(token)
     _record_identity(claims)
-    viewer_email = str(claims.get('email', '')).lower() if claims.get('email') else None
+
+    viewer_sub = claims.get('sub')
+    id_claims = _optional_id_token_claims(request)
+    id_sub = (id_claims or {}).get("sub")
+    if id_claims and viewer_sub and id_sub and viewer_sub != id_sub:
+        id_claims = None
+    if id_claims:
+        _record_identity(id_claims)
+
+    fe_claims = _optional_frontend_email(request)
+    if fe_claims and viewer_sub and fe_claims.get("sub") != viewer_sub:
+        fe_claims = None
+    if fe_claims:
+        _record_identity(fe_claims)
+
+    viewer_email = (
+        _extract_email_from_claims(claims)
+        or _extract_email_from_claims(id_claims)
+        or _extract_email_from_claims(fe_claims)
+    )
+    if not viewer_email and viewer_sub:
+        try:
+            identity = UserIdentity.objects.filter(sub=viewer_sub).first()
+            if identity and identity.email:
+                viewer_email = str(identity.email).lower()
+        except Exception:
+            pass
+    if not viewer_email and viewer_sub:
+        viewer_email = _auth0_user_email_by_sub(viewer_sub) or viewer_email
+
+    viewer_email = str(viewer_email).lower() if viewer_email else None
     now = timezone.now()
-    qs = StorageShare.objects.filter(visibility="private")
-    if viewer_email:
-        qs = qs.filter(models.Q(target_email=viewer_email) | models.Q(target_sub=claims['sub']))
-    else:
-        qs = qs.filter(target_sub=claims['sub'])
-    shares = qs.filter(models.Q(expires_at__isnull=True) | models.Q(expires_at__gt=now))
+    qs = StorageShare.objects.filter(
+        models.Q(visibility="private") | models.Q(visibility="protected")
+    ).filter(models.Q(expires_at__isnull=True) | models.Q(expires_at__gt=now))
+
+    allowed = []
+    for s in qs.order_by("-created_at"):
+        if s.visibility == "private":
+            if viewer_sub and s.target_sub and s.target_sub == viewer_sub:
+                allowed.append(s)
+                continue
+            if viewer_email and s.target_email and str(s.target_email).lower() == viewer_email:
+                allowed.append(s)
+                continue
+        elif s.visibility == "protected":
+            if viewer_email:
+                emails = s.allowed_emails or []
+                try:
+                    emails_l = [str(e).strip().lower() for e in emails]
+                except Exception:
+                    emails_l = []
+                if viewer_email in emails_l:
+                    allowed.append(s)
+                    continue
+
+    owner_email_cache: dict[str, Optional[str]] = {}
+
+    def _owner_email(owner_sub: str) -> Optional[str]:
+        if not owner_sub:
+            return None
+        cached = owner_email_cache.get(owner_sub)
+        if cached is not None:
+            return cached
+        email = None
+        try:
+            ident = UserIdentity.objects.filter(sub=owner_sub).first()
+            if ident and ident.email:
+                email = str(ident.email).strip().lower()
+        except Exception:
+            email = None
+        if not email:
+            email = _auth0_user_email_by_sub(owner_sub)
+        email = str(email).strip().lower() if email else None
+        owner_email_cache[owner_sub] = email
+        return email
+
     data = [
-        {"share_id": str(s.id), "owner_sub": s.owner_sub, "key": s.key, "is_directory": s.is_directory, "permission": s.permission, "expires_at": s.expires_at.isoformat() if s.expires_at else None, "target_email": s.target_email}
-        for s in shares
+        {
+            "share_id": str(s.id),
+            "owner_sub": s.owner_sub,
+            "owner_email": _owner_email(s.owner_sub),
+            "key": s.key,
+            "is_directory": s.is_directory,
+            "permission": s.permission,
+            "expires_at": s.expires_at.isoformat() if s.expires_at else None,
+            "target_email": s.target_email,
+            "visibility": s.visibility,
+        }
+        for s in allowed
     ]
     return JsonResponse({"shares": data})
 
@@ -1137,15 +2183,64 @@ def shared_download_link(request):
     token = getattr(request, "oauth_token", None)
     claims = dict(token)
     _record_identity(claims)
-    viewer_email = str(claims.get('email', '')).lower() if claims.get('email') else None
+
+    viewer_sub = claims.get('sub')
+    id_claims = _optional_id_token_claims(request)
+    id_sub = (id_claims or {}).get("sub")
+    if id_claims and viewer_sub and id_sub and viewer_sub != id_sub:
+        id_claims = None
+    if id_claims:
+        _record_identity(id_claims)
+
+    fe_claims = _optional_frontend_email(request)
+    if fe_claims and viewer_sub and fe_claims.get("sub") != viewer_sub:
+        fe_claims = None
+    if fe_claims:
+        _record_identity(fe_claims)
+
+    viewer_email = (
+        _extract_email_from_claims(claims)
+        or _extract_email_from_claims(id_claims)
+        or _extract_email_from_claims(fe_claims)
+    )
+    if not viewer_email and viewer_sub:
+        try:
+            identity = UserIdentity.objects.filter(sub=viewer_sub).first()
+            if identity and identity.email:
+                viewer_email = str(identity.email).lower()
+        except Exception:
+            pass
+    if not viewer_email and viewer_sub:
+        viewer_email = _auth0_user_email_by_sub(viewer_sub) or viewer_email
+
+    viewer_email = str(viewer_email).lower() if viewer_email else None
     share_id = request.GET.get("share_id")
     if not share_id:
         return JsonResponse({"error": "missing_share_id"}, status=400)
-    filters = {"id": share_id, "visibility": "private"}
-    if viewer_email:
-        share = StorageShare.objects.filter(models.Q(target_email=viewer_email) | models.Q(target_sub=claims['sub']), **filters).first()
-    else:
-        share = StorageShare.objects.filter(target_sub=claims['sub'], **filters).first()
+    share = StorageShare.objects.filter(id=share_id).first()
+    if not share:
+        return JsonResponse({"error": "not_found"}, status=404)
+    if share.visibility not in ("private", "protected"):
+        return JsonResponse({"error": "not_found"}, status=404)
+
+    # Authorization checks
+    authorized = False
+    if share.visibility == "private":
+        if viewer_sub and share.target_sub and share.target_sub == viewer_sub:
+            authorized = True
+        if not authorized and viewer_email and share.target_email and str(share.target_email).lower() == viewer_email:
+            authorized = True
+    elif share.visibility == "protected":
+        if viewer_email:
+            try:
+                emails = [str(e).strip().lower() for e in (share.allowed_emails or [])]
+            except Exception:
+                emails = []
+            if viewer_email in emails:
+                authorized = True
+
+    if not authorized:
+        return JsonResponse({"error": "not_found"}, status=404)
     if not share:
         return JsonResponse({"error": "not_found"}, status=404)
     if share.expires_at and share.expires_at <= timezone.now():
@@ -1156,7 +2251,7 @@ def shared_download_link(request):
     except Exception as e:
         return JsonResponse({"error": "s3_client_error", "details": str(e)}, status=500)
 
-    owner_prefix = f"{share.owner_sub}/"
+    owner_prefix = _user_root_prefix(share.owner_sub)
     key = f"{owner_prefix}{share.key}"
     if key.endswith("/"):
         return JsonResponse({"error": "cannot_download_directory"}, status=400)
@@ -1184,7 +2279,7 @@ def multipart_initiate(request):
         return JsonResponse({"error": "s3_client_error", "details": str(e)}, status=500)
     token = getattr(request, "oauth_token", None)
     claims = dict(token)
-    user_prefix = f"{claims['sub']}/"
+    user_prefix = _user_root_prefix(claims['sub'])
     subdir = _sanitize_subpath(request.POST.get("path", "")).rstrip("/")
     filename = request.POST.get("filename")
     total_size = request.POST.get("total_size")
@@ -1207,7 +2302,14 @@ def multipart_initiate(request):
         name, ext = os.path.splitext(key)
         version_key = f"{name}.v{next_version}{ext}"
         s3.copy_object(Bucket=bucket, CopySource={"Bucket": bucket, "Key": key}, Key=version_key)
-        FileVersion.objects.create(owner_sub=claims['sub'], key=logical, version=next_version, object_key=version_key, size=head.get("ContentLength"), etag=head.get("ETag"))
+        FileVersion.objects.create(
+            owner_sub=claims['sub'],
+            key=logical,
+            version=next_version,
+            object_key=version_key,
+            size=head.get("ContentLength"),
+            etag=head.get("ETag"),
+        )
     except ClientError:
         pass
 
@@ -1305,6 +2407,396 @@ def multipart_abort(request):
 
 @require_auth(None)
 @csrf_exempt
+@require_http_methods(["POST"])
+def chunked_initiate(request):
+    """Start/resume a chunked upload.
+
+        Client sends the whole-file checksum first. Chunk checksums may be sent
+        up-front (for explicit missing list) or omitted (client can discover
+        present chunks opportunistically as it computes chunk checksums).
+    Server responds with which chunks already exist under:
+      <sub>/chunks/<file_checksum>/<chunk_checksum>
+    """
+    bucket = settings.S3_BUCKET
+    if not bucket:
+        return JsonResponse({"error": "s3_not_configured"}, status=500)
+    try:
+        s3 = _get_s3_client()
+    except Exception as e:
+        return JsonResponse({"error": "s3_client_error", "details": str(e)}, status=500)
+
+    token = getattr(request, "oauth_token", None)
+    claims = dict(token)
+    sub = claims.get("sub")
+    if not sub:
+        return JsonResponse({"error": "unauthorized"}, status=401)
+
+    filename = request.POST.get("filename")
+    subdir = _sanitize_subpath(request.POST.get("path", "")).rstrip("/")
+    file_checksum = (request.POST.get("file_checksum") or "").strip().lower()
+    chunk_size = request.POST.get("chunk_size")
+    total_size = request.POST.get("total_size")
+    chunks_json = request.POST.get("chunk_checksums")
+
+    if not filename:
+        return JsonResponse({"error": "missing_filename"}, status=400)
+    if not _is_sha256_hex(file_checksum):
+        return JsonResponse({"error": "invalid_file_checksum"}, status=400)
+
+    normalized: list[str] = []
+    has_chunk_list = False
+    if chunks_json:
+        try:
+            chunk_checksums = json.loads(chunks_json)
+        except Exception:
+            return JsonResponse({"error": "invalid_chunk_checksums"}, status=400)
+        if not isinstance(chunk_checksums, list) or not chunk_checksums:
+            return JsonResponse({"error": "invalid_chunk_checksums"}, status=400)
+
+        for c in chunk_checksums:
+            s = str(c or "").strip().lower()
+            if not _is_sha256_hex(s):
+                return JsonResponse({"error": "invalid_chunk_checksum"}, status=400)
+            normalized.append(s)
+        has_chunk_list = True
+
+    # Enforce 2GB limit unless explicitly changed later.
+    if total_size:
+        try:
+            if int(total_size) > 2 * 1024 * 1024 * 1024:
+                return JsonResponse({"error": "file_too_large", "limit": 2 * 1024 * 1024 * 1024}, status=413)
+        except ValueError:
+            pass
+
+    if chunk_size:
+        try:
+            cs = int(chunk_size)
+            if cs != 1024 * 1024:
+                return JsonResponse({"error": "invalid_chunk_size", "expected": 1024 * 1024}, status=400)
+        except ValueError:
+            return JsonResponse({"error": "invalid_chunk_size", "expected": 1024 * 1024}, status=400)
+
+    chunks_prefix = f"{_user_chunks_prefix(sub)}{file_checksum}/"
+    manifest_key = f"{chunks_prefix}manifest.json"
+
+    # Persist/keep a manifest so the UI can show unfinished uploads after refresh.
+    started_at = None
+    try:
+        existing = s3.get_object(Bucket=bucket, Key=manifest_key)
+        body = existing.get("Body")
+        raw = body.read().decode("utf-8") if body else ""
+        data = json.loads(raw) if raw else {}
+        started_at = data.get("started_at")
+    except Exception:
+        started_at = None
+
+    if not started_at:
+        started_at = timezone.now().isoformat()
+
+    try:
+        manifest = {
+            "file_checksum": file_checksum,
+            "filename": filename,
+            "path": subdir,
+            "chunk_size": 1024 * 1024,
+            "total_size": int(total_size) if str(total_size or "").strip().isdigit() else None,
+            "chunk_checksums": normalized if has_chunk_list else [],
+            "started_at": started_at,
+            "updated_at": timezone.now().isoformat(),
+        }
+        s3.put_object(
+            Bucket=bucket,
+            Key=manifest_key,
+            Body=json.dumps(manifest).encode("utf-8"),
+            ContentType="application/json",
+        )
+    except Exception:
+        # Manifest is best-effort; uploads can still proceed without it.
+        pass
+    present: set[str] = set()
+    continuation = None
+    try:
+        while True:
+            kwargs = {"Bucket": bucket, "Prefix": chunks_prefix}
+            if continuation:
+                kwargs["ContinuationToken"] = continuation
+            resp = s3.list_objects_v2(**kwargs)
+            for obj in resp.get("Contents", []) or []:
+                key = obj.get("Key") or ""
+                # key ends with <chunk_checksum>
+                leaf = key.rsplit("/", 1)[-1]
+                leaf = str(leaf).strip().lower()
+                if _is_sha256_hex(leaf):
+                    present.add(leaf)
+            if resp.get("IsTruncated"):
+                continuation = resp.get("NextContinuationToken")
+            else:
+                break
+    except ClientError:
+        # If listing fails, treat as empty and let client proceed.
+        present = set()
+
+    missing = [c for c in normalized if c not in present] if has_chunk_list else []
+
+    logical_path = f"{subdir + '/' if subdir else ''}{filename}"
+    return JsonResponse({
+        "file_checksum": file_checksum,
+        "chunk_size": 1024 * 1024,
+        "filename": filename,
+        "path": subdir,
+        "logical_path": logical_path,
+        "present": list(present.intersection(set(normalized))) if has_chunk_list else list(present),
+        "missing": missing,
+    })
+
+
+@require_auth(None)
+@csrf_exempt
+@require_http_methods(["POST"])
+def chunked_upload_chunk(request):
+    """Upload a single 1MB chunk to <sub>/chunks/<file>/<chunk>.
+
+    Server verifies sha256(chunk_bytes) == chunk_checksum, then stores it.
+    """
+    bucket = settings.S3_BUCKET
+    if not bucket:
+        return JsonResponse({"error": "s3_not_configured"}, status=500)
+    try:
+        s3 = _get_s3_client()
+    except Exception as e:
+        return JsonResponse({"error": "s3_client_error", "details": str(e)}, status=500)
+
+    token = getattr(request, "oauth_token", None)
+    claims = dict(token)
+    sub = claims.get("sub")
+    if not sub:
+        return JsonResponse({"error": "unauthorized"}, status=401)
+
+    file_checksum = (request.POST.get("file_checksum") or "").strip().lower()
+    chunk_checksum = (request.POST.get("chunk_checksum") or "").strip().lower()
+    if not _is_sha256_hex(file_checksum) or not _is_sha256_hex(chunk_checksum):
+        return JsonResponse({"error": "invalid_checksum"}, status=400)
+
+    body_file = request.FILES.get("chunk")
+    if body_file is not None:
+        chunk_bytes = body_file.read()
+    else:
+        chunk_bytes = request.body
+
+    if not chunk_bytes:
+        return JsonResponse({"error": "missing_chunk"}, status=400)
+    if len(chunk_bytes) > 1024 * 1024:
+        return JsonResponse({"error": "chunk_too_large", "limit": 1024 * 1024}, status=413)
+
+    computed = hashlib.sha256(chunk_bytes).hexdigest()
+    if computed != chunk_checksum:
+        return JsonResponse({
+            "error": "chunk_checksum_mismatch",
+            "expected": chunk_checksum,
+            "got": computed,
+        }, status=400)
+
+    key = f"{_user_chunks_prefix(sub)}{file_checksum}/{chunk_checksum}"
+    try:
+        # Idempotent: if already exists, we still return confirmed.
+        try:
+            s3.head_object(Bucket=bucket, Key=key)
+            return JsonResponse({"ok": True, "confirmed": True, "chunk_checksum": chunk_checksum})
+        except ClientError:
+            pass
+
+        s3.put_object(Bucket=bucket, Key=key, Body=chunk_bytes, ContentType="application/octet-stream")
+        return JsonResponse({"ok": True, "confirmed": True, "chunk_checksum": chunk_checksum})
+    except ClientError as e:
+        return JsonResponse({"error": "s3_error", "details": str(e)}, status=502)
+
+
+@require_auth(None)
+@csrf_exempt
+@require_http_methods(["POST"])
+def chunked_complete(request):
+    """Finalize a chunked upload.
+
+    Reads staged chunks from <sub>/chunks/<file>/<chunk>, assembles into the final
+    object under <sub>/root/<path>/<filename>.
+
+    Note: S3 multipart upload enforces a 5MB minimum part size, so we aggregate
+    1MB chunks into >=5MB parts when uploading the final object.
+    """
+    bucket = settings.S3_BUCKET
+    if not bucket:
+        return JsonResponse({"error": "s3_not_configured"}, status=500)
+    try:
+        s3 = _get_s3_client()
+    except Exception as e:
+        return JsonResponse({"error": "s3_client_error", "details": str(e)}, status=500)
+
+    token = getattr(request, "oauth_token", None)
+    claims = dict(token)
+    sub = claims.get("sub")
+    if not sub:
+        return JsonResponse({"error": "unauthorized"}, status=401)
+
+    filename = request.POST.get("filename")
+    subdir = _sanitize_subpath(request.POST.get("path", "")).rstrip("/")
+    file_checksum = (request.POST.get("file_checksum") or "").strip().lower()
+    chunks_json = request.POST.get("chunk_checksums")
+    total_size = request.POST.get("total_size")
+
+    if not filename:
+        return JsonResponse({"error": "missing_filename"}, status=400)
+    if not _is_sha256_hex(file_checksum):
+        return JsonResponse({"error": "invalid_file_checksum"}, status=400)
+    if not chunks_json:
+        return JsonResponse({"error": "missing_chunk_checksums"}, status=400)
+
+    try:
+        chunk_checksums = json.loads(chunks_json)
+    except Exception:
+        return JsonResponse({"error": "invalid_chunk_checksums"}, status=400)
+    if not isinstance(chunk_checksums, list) or not chunk_checksums:
+        return JsonResponse({"error": "invalid_chunk_checksums"}, status=400)
+
+    normalized = []
+    for c in chunk_checksums:
+        s = str(c or "").strip().lower()
+        if not _is_sha256_hex(s):
+            return JsonResponse({"error": "invalid_chunk_checksum"}, status=400)
+        normalized.append(s)
+
+    # Enforce 2GB limit unless explicitly changed later.
+    if total_size:
+        try:
+            if int(total_size) > 2 * 1024 * 1024 * 1024:
+                return JsonResponse({"error": "file_too_large", "limit": 2 * 1024 * 1024 * 1024}, status=413)
+        except ValueError:
+            pass
+
+    user_prefix = _user_root_prefix(sub)
+    key = f"{user_prefix}{subdir + '/' if subdir else ''}{filename}"
+
+    # Ensure all chunks exist
+    missing = []
+    for chk in normalized:
+        chunk_key = f"{_user_chunks_prefix(sub)}{file_checksum}/{chk}"
+        try:
+            s3.head_object(Bucket=bucket, Key=chunk_key)
+        except ClientError:
+            missing.append(chk)
+    if missing:
+        return JsonResponse({"error": "missing_chunks", "missing": missing}, status=409)
+
+    # Version backup if exists (same behavior as normal uploads)
+    try:
+        head = s3.head_object(Bucket=bucket, Key=key)
+        logical = key[len(user_prefix):]
+        latest = FileVersion.objects.filter(owner_sub=sub, key=logical).order_by("-version").first()
+        next_version = (latest.version + 1) if latest else 1
+        name, ext = os.path.splitext(key)
+        version_key = f"{name}.v{next_version}{ext}"
+        s3.copy_object(Bucket=bucket, CopySource={"Bucket": bucket, "Key": key}, Key=version_key)
+        FileVersion.objects.create(
+            owner_sub=sub,
+            key=logical,
+            version=next_version,
+            object_key=version_key,
+            size=head.get("ContentLength"),
+            etag=head.get("ETag"),
+        )
+    except ClientError:
+        pass
+
+    # Assemble and upload using S3 multipart, but aggregate 1MB chunks into >=5MB parts.
+    upload_id = None
+    try:
+        create = s3.create_multipart_upload(Bucket=bucket, Key=key)
+        upload_id = create.get("UploadId")
+        if not upload_id:
+            return JsonResponse({"error": "multipart_create_failed"}, status=502)
+
+        parts = []
+        part_no = 1
+        min_part = 5 * 1024 * 1024
+        buffer = bytearray()
+        assembled_hasher = hashlib.sha256()
+
+        for idx, chk in enumerate(normalized):
+            chunk_key = f"{_user_chunks_prefix(sub)}{file_checksum}/{chk}"
+            obj = s3.get_object(Bucket=bucket, Key=chunk_key)
+            data = obj["Body"].read()
+            assembled_hasher.update(data)
+            buffer.extend(data)
+
+            is_last_chunk = (idx == len(normalized) - 1)
+            if (len(buffer) >= min_part) or is_last_chunk:
+                resp = s3.upload_part(
+                    Bucket=bucket,
+                    Key=key,
+                    PartNumber=part_no,
+                    UploadId=upload_id,
+                    Body=bytes(buffer),
+                )
+                parts.append({"PartNumber": part_no, "ETag": resp.get("ETag")})
+                part_no += 1
+                buffer = bytearray()
+
+        resp = s3.complete_multipart_upload(
+            Bucket=bucket,
+            Key=key,
+            UploadId=upload_id,
+            MultipartUpload={"Parts": parts},
+        )
+
+        assembled_checksum = assembled_hasher.hexdigest()
+        if assembled_checksum != file_checksum:
+            try:
+                s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)
+            except Exception:
+                pass
+            return JsonResponse({
+                "error": "file_checksum_mismatch",
+                "expected": file_checksum,
+                "got": assembled_checksum,
+            }, status=400)
+
+        ActivityLog.objects.create(
+            user_sub=sub,
+            action="upload_chunked",
+            key=key,
+            success=True,
+            extra={
+                "file_checksum": file_checksum,
+                "chunks": len(normalized),
+                "uploader_email": (_extract_email_from_claims(claims) or "").strip().lower() or None,
+            },
+        )
+
+        # Cleanup staged chunks (and manifest) so "unfinished uploads" doesn't linger.
+        try:
+            staging_prefix = f"{_user_chunks_prefix(sub)}{file_checksum}/"
+            _delete_s3_prefix(s3, bucket, staging_prefix)
+        except Exception:
+            pass
+
+        return JsonResponse({"ok": True, "key": key, "etag": resp.get("ETag")})
+    except ClientError as e:
+        try:
+            if upload_id:
+                s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)
+        except Exception:
+            pass
+        ActivityLog.objects.create(
+            user_sub=sub,
+            action="upload_chunked",
+            key=key,
+            success=False,
+            extra={"error": str(e), "file_checksum": file_checksum},
+        )
+        return JsonResponse({"error": "s3_error", "details": str(e)}, status=502)
+
+
+@require_auth(None)
+@csrf_exempt
 @require_http_methods(["DELETE"])
 def delete_item(request):
     bucket = settings.S3_BUCKET
@@ -1351,11 +2843,188 @@ def delete_item(request):
             ActivityLog.objects.create(
                 user_sub=claims['sub'], action="delete_prefix", key=key, success=True, extra={"deleted": deleted}
             )
+
+            # Delete any shares for this folder and anything under it
+            try:
+                StorageShare.objects.filter(owner_sub=claims['sub'], key__startswith=subkey).delete()
+            except Exception:
+                pass
             return JsonResponse({"deleted_prefix": key, "deleted_count": deleted})
         else:
             s3.delete_object(Bucket=bucket, Key=key)
             ActivityLog.objects.create(user_sub=claims['sub'], action="delete", key=key, success=True)
+
+            # Delete any share for this exact file key
+            try:
+                StorageShare.objects.filter(owner_sub=claims['sub'], key=subkey).delete()
+            except Exception:
+                pass
             return JsonResponse({"deleted": True, "key": key})
     except ClientError as e:
         ActivityLog.objects.create(user_sub=claims['sub'], action="delete", key=key, success=False, extra={"error": str(e)})
+        return JsonResponse({"error": "s3_error", "details": str(e)}, status=502)
+
+
+@require_auth(None)
+@csrf_exempt
+@require_http_methods(["GET"])
+def chunked_unfinished(request):
+    """List chunked upload manifests for the current user."""
+    bucket = settings.S3_BUCKET
+    if not bucket:
+        return JsonResponse({"error": "s3_not_configured"}, status=500)
+    try:
+        s3 = _get_s3_client()
+    except Exception as e:
+        return JsonResponse({"error": "s3_client_error", "details": str(e)}, status=500)
+
+    token = getattr(request, "oauth_token", None)
+    claims = dict(token)
+    sub = claims.get("sub")
+    if not sub:
+        return JsonResponse({"error": "unauthorized"}, status=401)
+
+    base_prefix = _user_chunks_prefix(sub)
+
+    # Discover per-upload prefixes without scanning every chunk object.
+    upload_prefixes = []
+    continuation = None
+    try:
+        while True:
+            kwargs = {"Bucket": bucket, "Prefix": base_prefix, "Delimiter": "/"}
+            if continuation:
+                kwargs["ContinuationToken"] = continuation
+            resp = s3.list_objects_v2(**kwargs)
+            for cp in resp.get("CommonPrefixes", []) or []:
+                pfx = cp.get("Prefix") or ""
+                if pfx and pfx != base_prefix:
+                    upload_prefixes.append(pfx)
+            if resp.get("IsTruncated"):
+                continuation = resp.get("NextContinuationToken")
+            else:
+                break
+    except ClientError as e:
+        return JsonResponse({"error": "s3_error", "details": str(e)}, status=502)
+
+    sessions = []
+    for upload_prefix in upload_prefixes:
+        manifest_key = f"{upload_prefix}manifest.json"
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=manifest_key)
+            raw = obj["Body"].read().decode("utf-8")
+            manifest = json.loads(raw)
+        except Exception:
+            continue
+
+        file_checksum = str(manifest.get("file_checksum") or "").strip().lower()
+        if not _is_sha256_hex(file_checksum):
+            continue
+
+        chunk_checksums = manifest.get("chunk_checksums")
+        if not isinstance(chunk_checksums, list) or not chunk_checksums:
+            continue
+        chunk_checksums = [str(x or "").strip().lower() for x in chunk_checksums]
+
+        # List present chunks for this file_checksum.
+        staging_prefix = f"{base_prefix}{file_checksum}/"
+        present = set()
+        cont2 = None
+        try:
+            while True:
+                kwargs2 = {"Bucket": bucket, "Prefix": staging_prefix}
+                if cont2:
+                    kwargs2["ContinuationToken"] = cont2
+                resp2 = s3.list_objects_v2(**kwargs2)
+                for o in resp2.get("Contents", []) or []:
+                    k2 = o.get("Key") or ""
+                    leaf = k2.rsplit("/", 1)[-1].strip().lower()
+                    if _is_sha256_hex(leaf):
+                        present.add(leaf)
+                if resp2.get("IsTruncated"):
+                    cont2 = resp2.get("NextContinuationToken")
+                else:
+                    break
+        except ClientError:
+            present = set()
+
+        # Compute uploaded_bytes based on present checksums and sizes (no HEAD per chunk).
+        chunk_size = int(manifest.get("chunk_size") or 1024 * 1024)
+        total_size = manifest.get("total_size")
+        try:
+            total_size_int = int(total_size) if total_size is not None else None
+        except Exception:
+            total_size_int = None
+
+        uploaded_bytes = 0
+        for idx, chk in enumerate(chunk_checksums):
+            if chk not in present:
+                continue
+            if total_size_int is None:
+                uploaded_bytes += chunk_size
+            else:
+                is_last = idx == len(chunk_checksums) - 1
+                if not is_last:
+                    uploaded_bytes += chunk_size
+                else:
+                    last_size = total_size_int - (chunk_size * (len(chunk_checksums) - 1))
+                    uploaded_bytes += max(0, int(last_size))
+
+        sessions.append({
+            "file_checksum": file_checksum,
+            "filename": manifest.get("filename"),
+            "path": manifest.get("path") or "",
+            "chunk_size": chunk_size,
+            "total_size": total_size_int,
+            "chunks_total": len(chunk_checksums),
+            "chunks_present": len([c for c in chunk_checksums if c in present]),
+            "uploaded_bytes": uploaded_bytes,
+            "started_at": manifest.get("started_at"),
+            "updated_at": manifest.get("updated_at"),
+        })
+
+    return JsonResponse({"uploads": sessions})
+
+
+@require_auth(None)
+@csrf_exempt
+@require_http_methods(["DELETE"])
+def chunked_abort(request):
+    """Abort a chunked upload by deleting its staged chunks."""
+    bucket = settings.S3_BUCKET
+    if not bucket:
+        return JsonResponse({"error": "s3_not_configured"}, status=500)
+    try:
+        s3 = _get_s3_client()
+    except Exception as e:
+        return JsonResponse({"error": "s3_client_error", "details": str(e)}, status=500)
+
+    token = getattr(request, "oauth_token", None)
+    claims = dict(token)
+    sub = claims.get("sub")
+    if not sub:
+        return JsonResponse({"error": "unauthorized"}, status=401)
+
+    file_checksum = (request.GET.get("file_checksum") or "").strip().lower()
+    if not _is_sha256_hex(file_checksum):
+        return JsonResponse({"error": "invalid_file_checksum"}, status=400)
+
+    prefix = f"{_user_chunks_prefix(sub)}{file_checksum}/"
+    try:
+        deleted = _delete_s3_prefix(s3, bucket, prefix)
+        ActivityLog.objects.create(
+            user_sub=sub,
+            action="upload_chunked_abort",
+            key=prefix,
+            success=True,
+            extra={"file_checksum": file_checksum, "deleted": deleted},
+        )
+        return JsonResponse({"ok": True, "deleted": deleted})
+    except ClientError as e:
+        ActivityLog.objects.create(
+            user_sub=sub,
+            action="upload_chunked_abort",
+            key=prefix,
+            success=False,
+            extra={"file_checksum": file_checksum, "error": str(e)},
+        )
         return JsonResponse({"error": "s3_error", "details": str(e)}, status=502)
