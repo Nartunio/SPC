@@ -1,7 +1,7 @@
 import boto3
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
-from django.http import JsonResponse
+from django.http import JsonResponse, StreamingHttpResponse
 from django.views.decorators.http import require_http_methods
 from django.views.decorators.csrf import csrf_exempt
 from config import settings
@@ -10,6 +10,8 @@ from .models import ActivityLog, FileVersion, StorageShare
 from django.utils import timezone
 from datetime import timedelta
 import os
+import io
+import zipfile
 
 
 def _get_s3_client():
@@ -151,7 +153,17 @@ def create_directory(request):
 
     key = f"{user_prefix}{subpath}/"
     try:
-        s3.put_object(Bucket=bucket, Key=key)
+        # Create all intermediate parent directories
+        parts = subpath.split("/")
+        for i in range(len(parts)):
+            parent_key = f"{user_prefix}{'/'.join(parts[:i+1])}/"
+            try:
+                exists = s3.list_objects_v2(Bucket=bucket, Prefix=parent_key, MaxKeys=1)
+                if exists.get("KeyCount", 0) == 0:
+                    s3.put_object(Bucket=bucket, Key=parent_key)
+            except ClientError:
+                pass
+        
         if claims.get('sub'):
             ActivityLog.objects.create(user_sub=claims['sub'], action="create_dir", key=key, success=True)
         return JsonResponse({"created": True, "key": key})
@@ -232,6 +244,7 @@ def delete_item(request):
         return JsonResponse({"error": "s3_client_error", "details": str(e)}, status=500)
 
     user_prefix = _user_prefix_from_request(request)
+    claims = dict(getattr(request, "oauth_token", {}))
     # Support key from query string or form
     raw_key = request.GET.get("key") or request.POST.get("key") or ""
     subkey = _sanitize_subpath(raw_key)
@@ -272,6 +285,185 @@ def delete_item(request):
 
 
 @require_auth(None)
+@csrf_exempt
+@require_http_methods(["POST"])
+def move_item(request):
+    bucket = settings.S3_BUCKET
+    if not bucket:
+        return JsonResponse({"error": "s3_not_configured"}, status=500)
+
+    try:
+        s3 = _get_s3_client()
+    except Exception as e:
+        return JsonResponse({"error": "s3_client_error", "details": str(e)}, status=500)
+
+    user_prefix = _user_prefix_from_request(request)
+    claims = dict(getattr(request, "oauth_token", {}))
+    
+    # Get source and destination from POST data (FormData)
+    source_key = (request.POST.get("source") or "").strip()
+    dest_folder = (request.POST.get("destination") or "").strip()
+
+    # IMPORTANT: _sanitize_subpath removes trailing '/', but we need it to
+    # distinguish folders from files (S3 "folder" marker keys end with '/').
+    is_directory = source_key.endswith("/")
+    source_subkey = _sanitize_subpath(source_key).rstrip("/")
+    if is_directory and source_subkey:
+        source_subkey = f"{source_subkey}/"
+
+    dest_subpath = _sanitize_subpath(dest_folder).rstrip("/")
+
+    if not source_subkey:
+        return JsonResponse({"error": "missing_source"}, status=400)
+
+    source = f"{user_prefix}{source_subkey}"
+    
+    # Build destination key
+    if dest_subpath:
+        dest_prefix = f"{user_prefix}{dest_subpath}"
+        if not dest_prefix.endswith("/"):
+            dest_prefix += "/"
+    else:
+        dest_prefix = user_prefix
+    
+    # Extract the item name from source
+    item_name = source_subkey.rstrip("/").split("/")[-1]
+    destination = f"{dest_prefix}{item_name}{'/' if is_directory else ''}"
+    
+    # Avoid moving to same location
+    if source == destination:
+        return JsonResponse({"error": "same_source_destination"}, status=400)
+
+    try:
+        if is_directory:
+            # Move directory - copy all objects under this prefix
+            continuation = None
+            moved_count = 0
+            failed = []
+            while True:
+                list_kwargs = {"Bucket": bucket, "Prefix": source}
+                if continuation:
+                    list_kwargs["ContinuationToken"] = continuation
+                resp = s3.list_objects_v2(**list_kwargs)
+                contents = resp.get("Contents", [])
+                if not contents:
+                    break
+                
+                for obj in contents:
+                    old_key = obj["Key"]
+                    # Skip folder markers (keys ending with /)
+                    if old_key.endswith("/"):
+                        continue
+                    # Replace prefix (source and destination are both prefixes ending with '/')
+                    new_key = old_key.replace(source, destination, 1)
+                    # Copy object with error handling
+                    try:
+                        s3.copy_object(
+                            Bucket=bucket,
+                            CopySource={"Bucket": bucket, "Key": old_key},
+                            Key=new_key
+                        )
+                        # Delete original only if copy succeeded
+                        s3.delete_object(Bucket=bucket, Key=old_key)
+                        moved_count += 1
+                    except ClientError as copy_error:
+                        failed.append({"key": old_key, "error": str(copy_error)})
+                        continue
+                
+                if resp.get("IsTruncated"):
+                    continuation = resp.get("NextContinuationToken")
+                else:
+                    break
+            
+            # Create destination folder marker
+            if not destination.endswith("/"):
+                destination = destination + "/"
+            try:
+                s3.put_object(Bucket=bucket, Key=destination)
+            except ClientError:
+                pass
+
+            # Delete the source folder marker only when the move fully succeeded.
+            # If we had failures, leaving the marker avoids "hiding" objects that
+            # remain under the source prefix.
+
+            if failed:
+                ActivityLog.objects.create(
+                    user_sub=claims['sub'],
+                    action="move_prefix_partial",
+                    key=source,
+                    success=False,
+                    extra={
+                        "destination": destination,
+                        "moved": moved_count,
+                        "failed_count": len(failed),
+                        "failed": failed[:20],
+                    },
+                )
+                return JsonResponse(
+                    {
+                        "error": "partial_move",
+                        "details": "Some objects could not be moved.",
+                        "source": source,
+                        "destination": destination,
+                        "moved_count": moved_count,
+                        "failed_count": len(failed),
+                        "failed": failed[:20],
+                    },
+                    status=409,
+                )
+            
+            ActivityLog.objects.create(
+                user_sub=claims['sub'],
+                action="move_prefix",
+                key=source,
+                success=True,
+                extra={"destination": destination, "moved": moved_count}
+            )
+
+            try:
+                s3.delete_object(Bucket=bucket, Key=source)
+            except ClientError:
+                # If the marker doesn't exist, that's fine.
+                pass
+            return JsonResponse({"moved": True, "source": source, "destination": destination, "moved_count": moved_count})
+        else:
+            # Move file
+            s3.copy_object(
+                Bucket=bucket,
+                CopySource={"Bucket": bucket, "Key": source},
+                Key=destination
+            )
+            s3.delete_object(Bucket=bucket, Key=source)
+            ActivityLog.objects.create(
+                user_sub=claims['sub'],
+                action="move",
+                key=source,
+                success=True,
+                extra={"destination": destination}
+            )
+            return JsonResponse({"moved": True, "source": source, "destination": destination})
+    except ClientError as e:
+        ActivityLog.objects.create(
+            user_sub=claims['sub'],
+            action="move",
+            key=source,
+            success=False,
+            extra={"error": str(e), "destination": destination}
+        )
+        return JsonResponse({"error": "s3_error", "details": str(e)}, status=502)
+    except Exception as e:
+        ActivityLog.objects.create(
+            user_sub=claims['sub'],
+            action="move",
+            key=source if 'source' in locals() else "",
+            success=False,
+            extra={"error": str(e), "type": type(e).__name__}
+        )
+        return JsonResponse({"error": "server_error", "details": str(e)}, status=500)
+
+
+@require_auth(None)
 @require_http_methods(["GET"])
 def download_link(request):
     bucket = settings.S3_BUCKET
@@ -284,6 +476,7 @@ def download_link(request):
         return JsonResponse({"error": "s3_client_error", "details": str(e)}, status=500)
 
     user_prefix = _user_prefix_from_request(request)
+    claims = dict(getattr(request, "oauth_token", {}))
     raw_key = request.GET.get("key") or ""
     subkey = _sanitize_subpath(raw_key)
     if not subkey:
@@ -294,13 +487,86 @@ def download_link(request):
     try:
         url = s3.generate_presigned_url(
             ClientMethod="get_object",
-            Params={"Bucket": bucket, "Key": key},
+            Params={
+                "Bucket": bucket,
+                "Key": key,
+                "ResponseContentDisposition": "attachment",
+            },
             ExpiresIn=int(request.GET.get("expires", 300)),
         )
         ActivityLog.objects.create(user_sub=claims['sub'], action="download_link", key=key, success=True)
         return JsonResponse({"url": url, "key": key})
     except ClientError as e:
         ActivityLog.objects.create(user_sub=claims['sub'], action="download_link", key=key, success=False, extra={"error": str(e)})
+        return JsonResponse({"error": "s3_error", "details": str(e)}, status=502)
+
+
+@require_auth(None)
+@require_http_methods(["GET"])
+def download_folder_zip(request):
+    bucket = settings.S3_BUCKET
+    if not bucket:
+        return JsonResponse({"error": "s3_not_configured"}, status=500)
+
+    try:
+        s3 = _get_s3_client()
+    except Exception as e:
+        return JsonResponse({"error": "s3_client_error", "details": str(e)}, status=500)
+
+    user_prefix = _user_prefix_from_request(request)
+    claims = dict(getattr(request, "oauth_token", {}))
+    raw_path = request.GET.get("path") or ""
+    logical_path = _sanitize_subpath(raw_path).rstrip("/")
+    
+    if not logical_path:
+        return JsonResponse({"error": "invalid_path"}, status=400)
+
+    prefix = f"{user_prefix}{logical_path}/"
+    folder_name = logical_path.split("/")[-1] or "folder"
+
+    try:
+        def generate_zip():
+            with zipfile.ZipFile(io.BytesIO(), mode='w') as zip_buffer:
+                zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(zip_buffer, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
+                    # List all objects under the prefix
+                    continuation = None
+                    while True:
+                        list_kwargs = {"Bucket": bucket, "Prefix": prefix}
+                        if continuation:
+                            list_kwargs["ContinuationToken"] = continuation
+                        resp = s3.list_objects_v2(**list_kwargs)
+                        
+                        for obj in resp.get("Contents", []):
+                            key = obj["Key"]
+                            # Skip the folder marker itself
+                            if key == prefix:
+                                continue
+                            # Extract relative path within the folder
+                            relative_path = key[len(prefix):]
+                            if relative_path:
+                                # Get the file content from S3
+                                try:
+                                    file_obj = s3.get_object(Bucket=bucket, Key=key)
+                                    file_content = file_obj['Body'].read()
+                                    zf.writestr(relative_path, file_content)
+                                except ClientError:
+                                    pass
+                        
+                        if resp.get("IsTruncated"):
+                            continuation = resp.get("NextContinuationToken")
+                        else:
+                            break
+                
+                zip_buffer.seek(0)
+                yield zip_buffer.getvalue()
+
+        ActivityLog.objects.create(user_sub=claims['sub'], action="download_folder_zip", key=prefix, success=True)
+        response = StreamingHttpResponse(generate_zip(), content_type='application/zip')
+        response['Content-Disposition'] = f'attachment; filename="{folder_name}.zip"'
+        return response
+    except ClientError as e:
+        ActivityLog.objects.create(user_sub=claims['sub'], action="download_folder_zip", key=prefix, success=False, extra={"error": str(e)})
         return JsonResponse({"error": "s3_error", "details": str(e)}, status=502)
 
 

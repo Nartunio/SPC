@@ -42,7 +42,14 @@ export function createApi(getToken: () => Promise<string>) {
       return request('/upload', 'POST', form);
     },
     del: (key: string) => request(`/item?key=${encodeURIComponent(key)}`, 'DELETE'),
+    move: (source: string, destination: string) => {
+      const form = new FormData();
+      form.set('source', source);
+      form.set('destination', destination);
+      return request('/move', 'POST', form);
+    },
     downloadLink: (key: string, expires = 300) => request(`/download?key=${encodeURIComponent(key)}&expires=${expires}`, 'GET'),
+    downloadFolderZip: (path: string, expires = 300) => request(`/download-zip?path=${encodeURIComponent(path)}&expires=${expires}`, 'GET'),
     versions: (key: string) => request(`/versions?key=${encodeURIComponent(key)}`, 'GET'),
     restoreVersion: (key: string, version: number) => {
       const form = new FormData();
