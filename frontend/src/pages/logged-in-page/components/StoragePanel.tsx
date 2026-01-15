@@ -90,7 +90,7 @@ function formatDateTime(value?: string | null) {
   return d.toLocaleString();
 }
 
-export default function StoragePanel() {
+export function StoragePanelLegacy() {
   const { getAccessTokenSilently, loginWithRedirect, getIdTokenClaims } = useAuth0();
 
   const getTokenWithRenew = useCallback(async () => {
@@ -3208,3 +3208,5 @@ export default function StoragePanel() {
     </div>
   );
 }
+
+export { default } from "./storage-panel/StoragePanel";

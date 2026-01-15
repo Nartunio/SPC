@@ -1,5 +1,5 @@
 import { useAuth0 } from '@auth0/auth0-react';
-import StoragePanel from './components/StoragePanel';
+import StoragePanel from './components/storage-panel/StoragePanel';
 
 export default function LoggedInPage() {
   const { isAuthenticated, isLoading, loginWithRedirect, user, logout } = useAuth0();
