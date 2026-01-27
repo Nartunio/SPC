@@ -484,24 +484,36 @@ def get_files(request):
         last_modified = None
         created_by_email = None
         try:
-            earliest = (
+            # If the folder (prefix) was deleted at some point, ignore logs before the last delete.
+            delete_cutoff = (
                 ActivityLog.objects.filter(
                     user_sub=claims['sub'],
+                    action="delete_prefix",
                     success=True,
-                    key__startswith=folder_prefix,
+                    key=folder_prefix,
                 )
-                .exclude(action="list")
+                .only("created_at")
+                .order_by("-created_at")
+                .first()
+            )
+            cutoff_ts = delete_cutoff.created_at if delete_cutoff else None
+
+            base_folder_qs = ActivityLog.objects.filter(
+                user_sub=claims['sub'],
+                success=True,
+                key__startswith=folder_prefix,
+            ).exclude(action="list")
+            if cutoff_ts:
+                base_folder_qs = base_folder_qs.filter(created_at__gt=cutoff_ts)
+
+            earliest = (
+                base_folder_qs
                 .only("created_at", "extra")
                 .order_by("created_at")
                 .first()
             )
             latest = (
-                ActivityLog.objects.filter(
-                    user_sub=claims['sub'],
-                    success=True,
-                    key__startswith=folder_prefix,
-                )
-                .exclude(action="list")
+                base_folder_qs
                 .only("created_at")
                 .order_by("-created_at")
                 .first()
