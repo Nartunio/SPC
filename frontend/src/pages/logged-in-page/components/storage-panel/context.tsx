@@ -88,7 +88,7 @@ function useStoragePanelState() {
 
   const api = useMemo(
     () => createApi(getTokenWithRenew, getIdTokenRaw),
-    [getTokenWithRenew, getIdTokenRaw]
+    [getTokenWithRenew, getIdTokenRaw],
   );
 
   const [panelView, setPanelView] = useState<PanelView>("storage");
@@ -105,6 +105,8 @@ function useStoragePanelState() {
 
   const share = useShareDialog({ api, pushToast });
   const shares = useSharePanels({ api, pushToast });
+  const { refreshSharedToMe, setSharedToMe, refreshMyShares, setMySharesList } =
+    shares;
   const setOwnedShares = share.setOwnedShares;
 
   const refresh = useCallback(
@@ -124,12 +126,12 @@ function useStoragePanelState() {
       if (shareRes.ok) {
         const map: Record<string, ShareResult> = {};
         ((shareRes.data as any).shares || []).forEach(
-          (s: ShareResult) => (map[s.key] = s)
+          (s: ShareResult) => (map[s.key] = s),
         );
         setOwnedShares(map);
       }
     },
-    [api, pushToast, setOwnedShares]
+    [api, pushToast, setOwnedShares],
   );
 
   useEffect(() => {
@@ -143,15 +145,22 @@ function useStoragePanelState() {
   }, [currentPath, panelView, refresh]);
 
   useEffect(() => {
+    // Only refresh when tab actually changes; avoid reruns from object identity churn.
     if (panelView === "shared_to_me") {
-      shares.setSharedToMe(null);
-      void shares.refreshSharedToMe();
+      setSharedToMe(null);
+      void refreshSharedToMe();
     }
     if (panelView === "my_shares") {
-      shares.setMySharesList(null);
-      void shares.refreshMyShares();
+      setMySharesList(null);
+      void refreshMyShares();
     }
-  }, [panelView, shares]);
+  }, [
+    panelView,
+    refreshMyShares,
+    refreshSharedToMe,
+    setMySharesList,
+    setSharedToMe,
+  ]);
 
   const uploads = useChunkedUploads({
     api,
@@ -167,7 +176,7 @@ function useStoragePanelState() {
   const uploadFiles = useCallback(
     (files: File[], targetPath?: string) =>
       uploads.uploadFiles(files, targetPath),
-    [uploads]
+    [uploads],
   );
   const drag = useDragAndMove({
     api,
@@ -199,11 +208,11 @@ function useStoragePanelState() {
         pushToast(
           "error",
           "Could not copy",
-          err instanceof Error ? err.message : String(err)
+          err instanceof Error ? err.message : String(err),
         );
       }
     },
-    [pushToast]
+    [pushToast],
   );
 
   const onDownload = useCallback(
@@ -219,7 +228,7 @@ function useStoragePanelState() {
       link.click();
       document.body.removeChild(link);
     },
-    [api, pushToast]
+    [api, pushToast],
   );
 
   const onDelete = useCallback(
@@ -229,7 +238,7 @@ function useStoragePanelState() {
       if (!res.ok) return void pushToast("error", JSON.stringify(res.data));
       void refresh(currentPath);
     },
-    [api, currentPath, pushToast, refresh]
+    [api, currentPath, pushToast, refresh],
   );
 
   const joinedPath = useCallback(
@@ -237,7 +246,7 @@ function useStoragePanelState() {
       const clean = name.replace(/(^\/+|\/+?$)/g, "");
       return currentPath ? `${currentPath}/${clean}` : clean;
     },
-    [currentPath]
+    [currentPath],
   );
 
   const fullKey = useCallback(
@@ -245,7 +254,7 @@ function useStoragePanelState() {
       const path = joinedPath(name);
       return isDir ? `${path}/` : path;
     },
-    [joinedPath]
+    [joinedPath],
   );
 
   const onNewFolder = useCallback(async () => {
@@ -275,10 +284,10 @@ function useStoragePanelState() {
         const token = await getTokenWithRenew();
         const idToken = await getIdTokenRaw();
         const base = String(
-          (import.meta as any).env.VITE_API_BASE || "http://localhost:8000"
+          (import.meta as any).env.VITE_API_BASE || "http://localhost:8000",
         ).replace(/\/$/, "");
         const url = `${base}/storage/download-zip?path=${encodeURIComponent(
-          path
+          path,
         )}`;
 
         const res = await fetch(url, {
@@ -293,7 +302,7 @@ function useStoragePanelState() {
           return void pushToast(
             "error",
             "Download failed",
-            (await res.text()) || `HTTP ${res.status}`
+            (await res.text()) || `HTTP ${res.status}`,
           );
 
         const blob = await res.blob();
@@ -309,11 +318,11 @@ function useStoragePanelState() {
         pushToast(
           "error",
           "Download failed",
-          err instanceof Error ? err.message : String(err)
+          err instanceof Error ? err.message : String(err),
         );
       }
     },
-    [getIdTokenRaw, getTokenWithRenew, pushToast]
+    [getIdTokenRaw, getTokenWithRenew, pushToast],
   );
 
   return {
@@ -367,7 +376,7 @@ function useVersions({
   pushToast: (
     variant: Toast["variant"],
     text: string,
-    details?: string
+    details?: string,
   ) => void;
   refresh: () => void | Promise<void>;
 }) {
@@ -381,7 +390,7 @@ function useVersions({
       if (!res.ok) return void pushToast("error", JSON.stringify(res.data));
       setVersions((res.data as any).versions || []);
     },
-    [api, pushToast]
+    [api, pushToast],
   );
 
   const closeVersions = useCallback(() => {
@@ -397,7 +406,7 @@ function useVersions({
       closeVersions();
       void refresh();
     },
-    [api, closeVersions, pushToast, refresh, selectedKey]
+    [api, closeVersions, pushToast, refresh, selectedKey],
   );
 
   return { selectedKey, versions, showVersions, closeVersions, restoreVersion };
