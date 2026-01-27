@@ -1,4 +1,4 @@
-django>=6.0
+django
 djangorestframework>=3.16.1
 python-dotenv>=1.2.1
 requests>=2.32.5
