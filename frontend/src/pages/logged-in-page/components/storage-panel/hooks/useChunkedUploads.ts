@@ -507,7 +507,9 @@ export function useChunkedUploads({
         chunkChecksums,
       });
 
-      const MAX_CONCURRENT_CHUNK_UPLOADS = 2;
+      // Allow multiple chunks to upload in parallel. Tune this value if backends
+      // throttle aggressively; 4 keeps good throughput without overwhelming.
+      const MAX_CONCURRENT_CHUNK_UPLOADS = 128;
 
       const computeChunkChecksum = async (index: number) => {
         const start = index * UPLOAD_CHUNK_SIZE;
@@ -757,7 +759,19 @@ export function useChunkedUploads({
       uploadAbortRef.current.delete(id);
       uploadFileRef.current.delete(id);
       uploadChecksumCacheRef.current.delete(id);
-      setUploadTasks((prev) => prev.filter((t) => t.id !== id));
+      // Keep the task visible until the server surfaces the file in the explorer.
+      setUploadTasks((prev) =>
+        prev.map((t) =>
+          t.id === id
+            ? {
+                ...t,
+                status: "finalized_waiting",
+                inflightBytes: 0,
+                note: "Waiting for the file to appear in storage…",
+              }
+            : t
+        )
+      );
     },
     [api, getIdTokenRaw, getTokenWithRenew]
   );
@@ -881,120 +895,158 @@ export function useChunkedUploads({
   );
 
   // While a task is finalizing, poll the server for unfinished manifests.
-  // Once the manifest disappears, the server has cleaned up staged chunks and the
-  // file should be available (or about to show up). This prevents duplicate resumes.
+  // Once the manifest disappears, keep the task until the file is visible in the explorer.
   useEffect(() => {
     const hasFinalizing = uploadTasks.some((t) => t.status === "finalizing" && t.fileChecksum);
-    if (!hasFinalizing) {
-      if (finalizePollRef.current.timer) {
-        window.clearInterval(finalizePollRef.current.timer);
-        finalizePollRef.current.timer = null;
-      }
+    const hasWaiting = uploadTasks.some((t) => t.status === "finalized_waiting");
+
+    if (!hasFinalizing && !hasWaiting && finalizePollRef.current.timer) {
+      window.clearInterval(finalizePollRef.current.timer);
+      finalizePollRef.current.timer = null;
       finalizePollRef.current.tries = 0;
+    }
+    if (!hasFinalizing && !hasWaiting && visibilityPollRef.current.timer) {
+      window.clearInterval(visibilityPollRef.current.timer);
+      visibilityPollRef.current.timer = null;
+      visibilityPollRef.current.expected.clear();
+      visibilityPollRef.current.tries = 0;
       return;
     }
 
-    if (finalizePollRef.current.timer) return;
-    finalizePollRef.current.tries = 0;
+    if (hasFinalizing && !finalizePollRef.current.timer) {
+      finalizePollRef.current.tries = 0;
 
-    finalizePollRef.current.timer = window.setInterval(async () => {
-      try {
-        finalizePollRef.current.tries += 1;
-        const res = await api.chunked.unfinished();
-        if (!res.ok) return;
-        const uploads = (res.data as any)?.uploads;
-        const active = new Set(
-          (Array.isArray(uploads) ? uploads : [])
-            .map((u: any) => String(u?.file_checksum || "").toLowerCase())
-            .filter(Boolean)
-        );
+      finalizePollRef.current.timer = window.setInterval(async () => {
+        try {
+          finalizePollRef.current.tries += 1;
+          const res = await api.chunked.unfinished();
+          if (!res.ok) return;
+          const uploads = (res.data as any)?.uploads;
+          const active = new Set(
+            (Array.isArray(uploads) ? uploads : [])
+              .map((u: any) => String(u?.file_checksum || "").toLowerCase())
+              .filter(Boolean)
+          );
 
-        const completedChecksums: string[] = [];
-        for (const t of uploadTasksRef.current) {
-          if (t.status === "finalizing" && t.fileChecksum) {
-            const chk = String(t.fileChecksum).toLowerCase();
-            if (chk && !active.has(chk)) completedChecksums.push(chk);
-          }
-        }
-
-        if (completedChecksums.length) {
-          const expectedNames = new Set<string>();
-          // For eventual-consistency S3 list behavior (e.g. Hetzner), keep refreshing
-          // the current folder briefly until the new object shows up.
+          const completedChecksums: string[] = [];
           for (const t of uploadTasksRef.current) {
             if (t.status === "finalizing" && t.fileChecksum) {
               const chk = String(t.fileChecksum).toLowerCase();
-              if (chk && completedChecksums.includes(chk)) {
-                if ((t.targetPath || "") === (currentPath || "")) {
-                  const name = (t.fileName || "").trim();
-                  if (name) expectedNames.add(name);
-                }
-              }
+              if (chk && !active.has(chk)) completedChecksums.push(chk);
             }
           }
 
-          setUploadTasks((prev) =>
-            prev.filter(
-              (t) =>
-                !(
+          if (completedChecksums.length) {
+            const expectedNames = new Set<string>();
+            // For eventual-consistency S3 list behavior (e.g. Hetzner), keep refreshing
+            // the current folder briefly until the new object shows up.
+            for (const t of uploadTasksRef.current) {
+              if (t.status === "finalizing" && t.fileChecksum) {
+                const chk = String(t.fileChecksum).toLowerCase();
+                if (chk && completedChecksums.includes(chk)) {
+                  if ((t.targetPath || "") === (currentPath || "")) {
+                    const name = (t.fileName || "").trim();
+                    if (name) expectedNames.add(name);
+                  }
+                }
+              }
+            }
+
+            setUploadTasks((prev) =>
+              prev.map((t) => {
+                if (
                   t.status === "finalizing" &&
                   t.fileChecksum &&
                   completedChecksums.includes(String(t.fileChecksum).toLowerCase())
-                )
-            )
-          );
-          // Nudge the UI to refresh the current folder so the file appears.
+                ) {
+                  return {
+                    ...t,
+                    status: "finalized_waiting",
+                    note: "Waiting for the file to appear in storage…",
+                  };
+                }
+                return t;
+              })
+            );
+
+            if (panelView === "storage") {
+              void refresh(currentPath);
+            }
+
+            if (expectedNames.size > 0) {
+              for (const n of expectedNames) visibilityPollRef.current.expected.add(n);
+            }
+          }
+
+          // Stop polling after ~1 minute to avoid background churn.
+          if (finalizePollRef.current.tries >= 30) {
+            if (finalizePollRef.current.timer) {
+              window.clearInterval(finalizePollRef.current.timer);
+              finalizePollRef.current.timer = null;
+            }
+          }
+        } catch {
+          // ignore
+        }
+      }, 2000);
+    }
+
+    // Visibility poll runs while we expect files to surface or while tasks are waiting.
+    const startVisibilityPoll = () => {
+      if (visibilityPollRef.current.timer) return;
+      visibilityPollRef.current.tries = 0;
+      visibilityPollRef.current.timer = window.setInterval(() => {
+        try {
+          visibilityPollRef.current.tries += 1;
+          const snapshot = listRef.current;
+          const visible = new Set((snapshot?.files || []).map((f) => String(f?.name || "")).filter(Boolean));
+
+          const pendingNames = new Set(visibilityPollRef.current.expected);
+          for (const name of pendingNames) {
+            if (visible.has(name)) {
+              visibilityPollRef.current.expected.delete(name);
+              // Remove the task once the file is visible.
+              setUploadTasks((prev) => prev.filter((t) => !(t.fileName === name && t.status === "finalized_waiting")));
+            }
+          }
+
+          if (visibilityPollRef.current.expected.size === 0 && !uploadTasksRef.current.some((t) => t.status === "finalized_waiting")) {
+            if (visibilityPollRef.current.timer) {
+              window.clearInterval(visibilityPollRef.current.timer);
+              visibilityPollRef.current.timer = null;
+            }
+            visibilityPollRef.current.tries = 0;
+            return;
+          }
+
+          // Refresh the current folder to surface newly finalized files.
           if (panelView === "storage") {
             void refresh(currentPath);
           }
 
-          if (expectedNames.size > 0) {
-            // Start (or extend) a short-lived visibility poll.
-            for (const n of expectedNames) visibilityPollRef.current.expected.add(n);
-            if (!visibilityPollRef.current.timer) {
-              visibilityPollRef.current.tries = 0;
-              visibilityPollRef.current.timer = window.setInterval(() => {
-                try {
-                  visibilityPollRef.current.tries += 1;
-                  const snapshot = listRef.current;
-                  const visible = new Set((snapshot?.files || []).map((f) => String(f?.name || "")).filter(Boolean));
-
-                  for (const name of Array.from(visibilityPollRef.current.expected)) {
-                    if (visible.has(name)) visibilityPollRef.current.expected.delete(name);
-                  }
-
-                  if (visibilityPollRef.current.expected.size === 0 || visibilityPollRef.current.tries >= 10) {
-                    if (visibilityPollRef.current.timer) {
-                      window.clearInterval(visibilityPollRef.current.timer);
-                      visibilityPollRef.current.timer = null;
-                    }
-                    visibilityPollRef.current.expected.clear();
-                    return;
-                  }
-
-                  // Refresh the current folder again.
-                  if (panelView === "storage") {
-                    void refresh(currentPath);
-                  }
-                } catch {
-                  // ignore
-                }
-              }, 2000);
+          // After several tries, stop hammering but keep tasks visible for manual retry.
+          if (visibilityPollRef.current.tries >= 10) {
+            if (visibilityPollRef.current.timer) {
+              window.clearInterval(visibilityPollRef.current.timer);
+              visibilityPollRef.current.timer = null;
             }
           }
+        } catch {
+          // ignore
         }
+      }, 2000);
+    };
 
-        // Stop polling after ~1 minute to avoid background churn.
-        if (finalizePollRef.current.tries >= 30) {
-          if (finalizePollRef.current.timer) {
-            window.clearInterval(finalizePollRef.current.timer);
-            finalizePollRef.current.timer = null;
-          }
+    if (visibilityPollRef.current.expected.size > 0 || hasWaiting) {
+      // Seed expected names from any waiting tasks in the current folder.
+      for (const t of uploadTasksRef.current) {
+        if (t.status === "finalized_waiting" && (t.targetPath || "") === (currentPath || "")) {
+          const name = (t.fileName || "").trim();
+          if (name) visibilityPollRef.current.expected.add(name);
         }
-      } catch {
-        // ignore
       }
-    }, 2000);
+      startVisibilityPoll();
+    }
 
     return () => {
       if (finalizePollRef.current.timer) {

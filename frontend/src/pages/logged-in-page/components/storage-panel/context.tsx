@@ -26,10 +26,113 @@ type Ctx = ReturnType<typeof useStoragePanelState>;
 
 const StoragePanelContext = createContext<Ctx | null>(null);
 
+// Fallback used when a consumer is rendered outside of the provider; prevents hard crashes in dev
+// and shows empty, no-op state instead.
+const fallbackCtx: Ctx = {
+  api: null as any,
+  panelView: "storage",
+  setPanelView: () => undefined,
+  currentPath: "",
+  setCurrentPath: () => undefined,
+
+  toasts: [],
+  pushToast: () => undefined,
+  dismissToast: () => undefined,
+  toastMs: 4000,
+
+  list: null,
+  listRef: { current: null },
+  loading: false,
+  refresh: async () => undefined,
+
+  creatingDir: false,
+  onNewFolder: async () => undefined,
+
+  uploads: {
+    uploadTasks: [],
+    uploading: false,
+    smoothProgress: new Map(),
+    cancelUpload: async () => undefined,
+    pauseUpload: async () => undefined,
+    resumeUpload: () => undefined,
+    uploadFiles: async () => undefined,
+    handleFileInputChange: () => undefined,
+  } as any,
+
+  fileRef: { current: null },
+
+  drag: {
+    dragActive: false,
+    handleDragOver: () => undefined,
+    handleDragLeave: () => undefined,
+    handleDrop: () => undefined,
+    onItemDragStart: () => undefined,
+    onItemDragEnd: () => undefined,
+    onFolderDragOver: () => undefined,
+    onFolderDragLeave: () => undefined,
+    onFolderDrop: () => undefined,
+  } as any,
+
+  share: {
+    openShare: () => undefined,
+    openShareFromResult: () => undefined,
+    closeShare: () => undefined,
+    submitShare: async () => undefined,
+    shareState: null,
+    shareLoading: false,
+    setOwnedShares: () => undefined,
+    ownedShares: {},
+  } as any,
+
+  shares: {
+    sharedToMe: null,
+    setSharedToMe: () => undefined,
+    sharedToMeLoading: false,
+    refreshSharedToMe: async () => undefined,
+    downloadSharedFile: async () => undefined,
+
+    mySharesList: null,
+    setMySharesList: () => undefined,
+    mySharesLoading: false,
+    refreshMyShares: async () => undefined,
+    revokeMyShare: async () => false,
+  } as any,
+
+  activity: {
+    logs: [],
+    loading: false,
+    hasMore: false,
+    refresh: async () => undefined,
+    fetchMore: async () => undefined,
+  } as any,
+
+  versions: {
+    selectedKey: null,
+    versions: null,
+    showVersions: async () => undefined,
+    closeVersions: () => undefined,
+    restoreVersion: async () => undefined,
+  },
+
+  copyText: async () => undefined,
+  onDownload: async () => undefined,
+  onDelete: async () => undefined,
+  onDownloadFolderZip: async () => undefined,
+  fullKey: (name: string) => name,
+  joinedPath: (name: string) => name,
+};
+
 export function useStoragePanel() {
   const ctx = useContext(StoragePanelContext);
-  if (!ctx)
-    throw new Error("useStoragePanel must be used within StoragePanelProvider");
+  if (!ctx) {
+    if (import.meta.env.DEV) {
+      // eslint-disable-next-line no-console
+      console.error(
+        "useStoragePanel used outside StoragePanelProvider; rendering with fallback no-op state.",
+      );
+    }
+    return fallbackCtx;
+  }
   return ctx;
 }
 

@@ -113,7 +113,8 @@ export function useUploadTaskPersistence({
             t?.status === "paused" ||
             t?.status === "hashing" ||
             t?.status === "uploading" ||
-            t?.status === "finalizing"
+            t?.status === "finalizing" ||
+            t?.status === "finalized_waiting"
               ? t.status
               : "paused";
 
@@ -124,11 +125,13 @@ export function useUploadTaskPersistence({
               ? t.note
               : status === "finalizing"
                 ? "Finalizing on server. This can take a bit for large files."
-                : wasActive
-                ? hasServerHandle
-                  ? "Interrupted by reload. Re-upload the same file to resume from uploaded chunks."
-                  : "Interrupted by reload. Select the file again to restart upload."
-                : undefined;
+                : status === "finalized_waiting"
+                  ? "Waiting for the file to appear in storage…"
+                  : wasActive
+                  ? hasServerHandle
+                    ? "Interrupted by reload. Re-upload the same file to resume from uploaded chunks."
+                    : "Interrupted by reload. Select the file again to restart upload."
+                  : undefined;
 
           return {
             id: String(t?.id || `rehydrated_local_${startedAt}`),

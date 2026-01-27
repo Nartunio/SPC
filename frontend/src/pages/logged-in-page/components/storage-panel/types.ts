@@ -52,7 +52,13 @@ export type SharedWithMeShare = {
 
 export type PanelView = "storage" | "shared_to_me" | "my_shares" | "activity";
 
-export type UploadTaskStatus = "hashing" | "uploading" | "finalizing" | "paused" | "error";
+export type UploadTaskStatus =
+  | "hashing"
+  | "uploading"
+  | "finalizing"
+  | "finalized_waiting"
+  | "paused"
+  | "error";
 
 export type UploadTask = {
   id: string;
